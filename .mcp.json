@@ -1,0 +1,95 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "@playwright/mcp@latest"
+      ]
+    },
+    "github-evilflowers": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "-e", "GITHUB_TOOLSETS",
+        "ghcr.io/github/github-mcp-server"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PAT_EVILFLOWERS}",
+        "GITHUB_TOOLSETS": "default,projects,orgs,actions"
+      }
+    },
+    "github-sibyx": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "-e", "GITHUB_TOOLSETS",
+        "ghcr.io/github/github-mcp-server"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PAT_SIBYX}",
+        "GITHUB_TOOLSETS": "default,projects,orgs,actions"
+      }
+    },
+    "linux-ssh": {
+      "command": "uvx",
+      "args": ["linux-mcp-server"],
+      "env": {
+        "LINUX_MCP_ALLOWED_LOG_PATHS": "/var/log/syslog,/var/log/auth.log,/var/log/kern.log"
+      }
+    },
+    "grafana": {
+      "command": "op",
+      "args": ["run", "--no-masking", "--", "uvx", "mcp-grafana@2.2.0", "--disable-write"],
+      "env": {
+        "GRAFANA_URL": "http://grafana.observability.stu.k8s.internal",
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN": "${GRAFANA_SERVICE_ACCOUNT_TOKEN}"
+      }
+    },
+    "tempo": {
+      "type": "http",
+      "url": "http://tempo.observability.stu.k8s.internal:3200/api/mcp"
+    },
+    "ripwire": {
+      "command": "ripwire",
+      "args": ["--mcp"]
+    },
+    "postgres": {
+      "command": "uvx",
+      "args": ["--refresh-package", "postgres-mcp", "--with", "mcp<2", "--from", "git+https://github.com/monad-wireless/postgres-mcp@main", "postgres-mcp", "--access-mode=restricted", "--allow-extension-functions=*", "--default-database=evilflowers_dev"],
+      "env": {
+        "DATABASE_URI_EVILFLOWERS": "${DATABASE_URI_EVILFLOWERS}",
+        "DATABASE_URI_EVILFLOWERS_DEV": "${DATABASE_URI_EVILFLOWERS_DEV}",
+        "DATABASE_URI_READIUM_LCP": "${DATABASE_URI_READIUM_LCP}",
+        "DATABASE_URI_READIUM_LSD": "${DATABASE_URI_READIUM_LSD}",
+        "DATABASE_URI_READIUM_LCP_DEV": "${DATABASE_URI_READIUM_LCP_DEV}",
+        "DATABASE_URI_READIUM_LSD_DEV": "${DATABASE_URI_READIUM_LSD_DEV}",
+        "DATABASE_URI_FIDER": "${DATABASE_URI_FIDER}",
+        "DATABASE_URI_UMAMI": "${DATABASE_URI_UMAMI}"
+      }
+    },
+    "elvira": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote",
+        "https://evilflowers.elvira.stuba.sk/mcp/v1",
+        "--header", "Authorization: Bearer ${ELVIRA_API_KEY}"
+      ],
+      "env": { "ELVIRA_API_KEY": "${ELVIRA_API_KEY}" }
+    },
+    "elvira-dev": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote",
+        "https://dev.evilflowers.elvira.stuba.sk/mcp/v1",
+        "--header", "Authorization: Bearer ${ELVIRA_DEV_API_KEY}"
+      ],
+      "env": { "ELVIRA_API_KEY": "${}" }
+    },
+    "evilflowers-knowledge": {
+      "type": "http",
+      "url": "http://evilflowers-knowledge.intranet.stu.k8s.internal/mcp"
+    }
+  }
+}

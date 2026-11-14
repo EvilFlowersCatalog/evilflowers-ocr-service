@@ -1,0 +1,178 @@
+# OCR service image: test, build, push to GHCR (private), deploy to the dev environment.
+# Contract: knowledge note Deploy-a-Service §1 and §4; jobs copied from knowledge `intranet-image.yml`.
+#
+#   push to the default branch → check, build, smoke test, push :master :sha-<short>, deploy to evilflowers-dev
+#   push to another branch     → check, build, smoke test, push :sha-<short>
+#   pull request               → check, build, smoke test (no push)
+#   manual                     → as a push of the chosen ref
+#
+# Deploy: the dev Deployment `ocr` runs :master with imagePullPolicy Always, so a new image goes live
+# with a rollout restart. The `deploy` job runs on the self-hosted runner INSIDE k3s (runs-on:
+# elvira-k3s), whose ServiceAccount may restart Deployments only in `github_runner_deploy_namespaces`
+# (roles/github_runner). It then checks that the running pods use the digest just pushed.
+#
+# Prerequisites outside this repo (one time): this repository in the runner group `elvira-k3s`, and the
+# Deployment `ocr` in evilflowers-dev (knowledge, Ansible role evilflowers_k8s). Until then set the
+# repository variable DEPLOY_DEV=false (or leave it unset) and the deploy job is skipped.
+
+name: image
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/evilflowerscatalog/evilflowers-ocr-service
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ocr-check-${{ github.ref }}
+      cancel-in-progress: true
+    # tests/test_worker_e2e.py: a real prefork worker against a real Redis.
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 15
+    env:
+      TEST_REDIS_URL: redis://localhost:6379/15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      # The real-OCR tests need Tesseract (English is enough for the fixtures).
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-osd ghostscript
+      - name: Install
+        run: uv sync --locked --all-extras
+      - name: Lint
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+      - name: Test
+        run: uv run pytest -q
+
+  image:
+    needs: check
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ocr-image-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=master,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+      # Build once into the local daemon, prove the image works the way k8s runs it, then push.
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: ocr-service:smoke
+          build-args: |
+            IMAGE_TAG=${{ github.ref_name }}@${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Read-only root, no network, uid 65534, /tmp as the only writable path: every model must be
+      # baked in, and both engines must OCR a page in a Latin and a Cyrillic language.
+      - name: Smoke test (read-only, offline, non-root)
+        run: |
+          docker run --rm --read-only --network none --user 65534:65534 --tmpfs /tmp \
+            ocr-service:smoke python -m evilflowers_ocr_worker selftest -l slk ces eng rus
+      - id: build
+        name: Push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            IMAGE_TAG=${{ github.ref_name }}@${{ github.sha }}
+          cache-from: type=gha
+
+  deploy:
+    needs: image
+    if: >-
+      github.event_name != 'pull_request'
+      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      && vars.DEPLOY_DEV == 'true'
+    runs-on: elvira-k3s            # ARC scale set in k3s (knowledge: roles/github_runner)
+    environment:
+      name: development
+    concurrency:
+      group: deploy-ocr-evilflowers-dev
+      cancel-in-progress: false
+    permissions: {}
+    env:
+      NAMESPACE: evilflowers-dev
+      DEPLOYMENT: ocr
+      DIGEST: ${{ needs.image.outputs.digest }}
+      KUBECTL_VERSION: v1.31.5     # = the cluster (k3s v1.31.5+k3s1)
+      KUBECTL_SHA256: fbecbfd375b3686002c2e81d51c390172f5ffba3d6b47920d55342cb03f557af   # dl.k8s.io …/linux/amd64/kubectl.sha256
+    steps:
+      - name: kubectl ${{ env.KUBECTL_VERSION }} (checksum-pinned)
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  $RUNNER_TEMP/kubectl" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/kubectl"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      # In-cluster credentials: the pod's ServiceAccount arc-deployer.
+      - name: Restart onto the new :master
+        run: kubectl -n "$NAMESPACE" rollout restart "deployment/$DEPLOYMENT"
+      # A Celery worker has no port and no probes: `rollout status` returns once the new pod runs.
+      # The old pod may be finishing a book (terminationGracePeriodSeconds), hence the long timeout.
+      - name: Wait for the rollout
+        run: kubectl -n "$NAMESPACE" rollout status "deployment/$DEPLOYMENT" --timeout=900s
+      - name: Running pods use ${{ env.DIGEST }}
+        run: |
+          ids=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=$DEPLOYMENT" \
+            -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{range .status.containerStatuses}}{{.imageID}}{{"\n"}}{{end}}{{end}}{{end}}')
+          echo "$ids"
+          test -n "$ids"
+          if echo "$ids" | grep -v -- "@${DIGEST}\$"; then
+            echo "::error::a running pod does not use ${DIGEST}"
+            exit 1
+          fi
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy to ${NAMESPACE}: ${{ job.status }}"
+            echo
+            echo "Digest \`${DIGEST}\`, commit \`${GITHUB_SHA::7}\`."
+            echo
+            echo "Grafana (VPN): http://grafana.observability.stu.k8s.internal → Explore"
+            echo "- Tempo: \`{resource.service.name=\"ocr\"}\`"
+            echo "- Loki: \`{namespace=\"${NAMESPACE}\", service_name=\"ocr\"} | json\`"
+            echo "- Mimir: \`ocr_pages_total\`, \`ocr_duration_seconds_bucket\`, \`ocr_reports_total\`"
+          } >> "$GITHUB_STEP_SUMMARY"
