@@ -1,10 +1,13 @@
-"""Issue #4 telemetry with an SDK provider on (in-memory exporters from conftest)."""
+"""Issue #4 telemetry, through the kit since #6, with an SDK provider on (in-memory exporters from conftest)."""
+
+import os
 
 import pytest
+from evilflowers_worker.observability.setup import build_resource
 
 from conftest import METRICS, SPANS, kwargs, needs_tesseract, write_scanned
-from evilflowers_ocr_worker import jobs
-from evilflowers_ocr_worker.observability import setup
+from evilflowers_ocr_worker import jobs, metrics
+from evilflowers_ocr_worker.contract import OcrRequest
 
 
 def metric_points() -> dict[str, list]:
@@ -24,7 +27,7 @@ def test_ocr_run_span_and_metrics(settings, storage):
     args = kwargs()
     write_scanned(storage / args["source"], pages=2)
 
-    jobs.run("22222222-2222-2222-2222-222222222222", args, settings)
+    jobs.run(OcrRequest.model_validate(args), "22222222-2222-2222-2222-222222222222", settings)
 
     (span,) = [span for span in SPANS.get_finished_spans() if span.name == "ocr.run"]
     attributes = dict(span.attributes)
@@ -47,31 +50,16 @@ def test_ocr_run_span_and_metrics(settings, storage):
 
 
 def test_failed_run_counts_pages_as_failed():
-    from evilflowers_ocr_worker.observability import metrics as worker_metrics
-
-    worker_metrics.record_run("rapidocr", "failed", 1.0, pages=7, pages_ocred=None)
+    metrics.record_run("rapidocr", "failed", 1.0, pages=7, pages_ocred=None)
     pages = {tuple(sorted(p.attributes.items())): p.value for p in metric_points()["ocr.pages"]}
     assert pages[(("engine", "rapidocr"), ("outcome", "failed"))] >= 7
     assert (("engine", "rapidocr"), ("outcome", "skipped")) not in pages
 
 
-def test_endpoint_is_derived_from_host_ip(monkeypatch):
-    for name in setup.ENDPOINT_VARIABLES:
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("HOST_IP", "10.0.0.7")
-    assert setup.endpoint() == "http://10.0.0.7:4318"
-
-
-def test_no_endpoint_no_telemetry(monkeypatch):
-    for name in setup.ENDPOINT_VARIABLES:
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv("HOST_IP", raising=False)
-    assert setup.endpoint() is None
-
-
-def test_resource_defaults_to_service_ocr(monkeypatch):
-    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+def test_resource_keeps_service_ocr(monkeypatch):
+    """The dashboards query service.name="ocr"; the kit's default would be evilflowers-ocr."""
     monkeypatch.delenv("OTEL_RESOURCE_ATTRIBUTES", raising=False)
-    resource = setup.build_resource()
+    assert os.environ["OTEL_SERVICE_NAME"] == "ocr"
+    resource = build_resource()
     assert resource.attributes["service.name"] == "ocr"
     assert resource.attributes["service.namespace"] == "elvira"

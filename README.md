@@ -92,12 +92,24 @@ would refuse the outcome of the redelivery, which carries the same token.
 - **`TASK_TIME_LIMIT` (3 h 55 min) is Celery's hard kill.** The 15-minute gap between the soft and hard
   limits covers one page's worst case (`TESSERACT_TIMEOUT`, 10 min) plus writing the destination and the
   outcome file (5 min allowed).
-- **On SIGTERM** (rollout, scale-in; `REMAP_SIGTERM=SIGQUIT` makes it a cold shutdown), the remaining pages
-  are abandoned at once:
-  - no destination and no outcome file are written;
-  - the scratch directory is removed;
-  - Redis gets the message back (`acks_late`), so another worker redoes the same run with the same token.
-    The test suite checks all of this end to end.
+- **On SIGTERM** (rollout, scale-in), evilflowers-worker's `shutdown` takes over. There is no
+  `REMAP_SIGTERM` and no Celery soft shutdown any more; that path redid a finished book on dev.
+  - SIGTERM is a warm shutdown. An idle worker exits at once. A book in hand runs on for
+    `WORKER_SOFT_SHUTDOWN_TIMEOUT` (10 s). If it finishes, it writes its outcome and is acknowledged.
+  - After the grace, the cold cancel terminates the child and the remaining pages are abandoned. No destination
+    and no outcome file are written, the scratch directory is removed, and Redis gets the message back at once.
+    The redelivery carries the same token. If even the cancel does not stop the child within
+    `WORKER_CANCEL_TIMEOUT` (10 s), the worker requeues the message itself and exits.
+  - A deliberate requeue gives its delivery back, so stopping a pod never counts towards the cap.
+  - **Short grace, pod grace unchanged.** A book takes minutes to hours and almost never finishes inside any
+    grace, so a longer one only delays the requeue. 10 s + 10 s (plus the fallback's Redis call) stays under the
+    pod's `terminationGracePeriodSeconds` of 30 s (knowledge#54). Raise both together, or the pod is SIGKILLed
+    before the requeue and the book waits out the 12 h visibility timeout.
+- **A PDF that kills the worker** (OOM) is redelivered (`acks_late`, `reject_on_worker_lost`) at most
+  `MAX_DELIVERIES` (5) times. The delivery after that writes a `failed` outcome ("gave up after N deliveries")
+  and raises, instead of looping forever.
+
+The test suite (`tests/test_worker_e2e.py`) checks every case end to end against a real Redis.
 
 The task's return value becomes the job's `result` in the ledger. It is kept compact (`status`, `pages`,
 `pages_ocred`, `engine`, `seconds`) because Celery's event carries a repr capped at 1024 characters. The
@@ -176,25 +188,30 @@ Everything comes from the environment (or `.env`, see `.env.sample`).
 | `TASK_SOFT_TIME_LIMIT` / `TASK_TIME_LIMIT` | `13200` / `14100` s | run deadline / Celery hard kill; both below the catalog's `EVILFLOWERS_OCR_TIME_LIMIT` (4 h) |
 | `BROKER_VISIBILITY_TIMEOUT` | `43200` s | above the hard limit, and **equal to the other consumers of Redis db 7**; the shortest value wins for everyone (knowledge#30) |
 | `TESSERACT_TIMEOUT` | `600` s | per page |
+| `WORKER_SOFT_SHUTDOWN_TIMEOUT` / `WORKER_CANCEL_TIMEOUT` | `10` / `10` s | scale-in grace / cold cancel; together under the pod's `terminationGracePeriodSeconds` (30 s) |
+| `MAX_DELIVERIES` | `5` | deliveries of one message before the book is given up `failed` (`0`: no cap) |
 | `LOG_LEVEL`, `LOG_FORMAT` | `INFO`, `json` | |
 | `OTEL_*`, `HOST_IP` | — | telemetry stays off without an endpoint (Deploy-a-Service §3) |
 
 ## Telemetry
 
-Telemetry follows the knowledge note **Deploy-a-Service**. It starts in the prefork child
+Telemetry comes from [evilflowers-worker](https://github.com/EvilFlowersCatalog/evilflowers-worker)'s
+`observability` and follows the knowledge note **Deploy-a-Service**. It starts in the prefork child
 (`worker_process_init`) and exports over OTLP/HTTP to `http://$(HOST_IP):4318`. The pod needs the label
-`elvira.stuba.sk/instrumentation: otel-sdk`.
+`elvira.stuba.sk/instrumentation: otel-sdk`. `service.name` stays `ocr` (the worker sets `OTEL_SERVICE_NAME`
+unless the pod does).
 
 - **Spans:**
   - the Celery consumer span;
-  - `ocr.run`, carrying `evilflowers.job.id`, `evilflowers.run.id`, `evilflowers.acquisition.id`,
-    `ocr.engine`, `ocr.pages`, `ocr.pages_ocred` and `ocr.outcome`.
+  - `ocr.run`, carrying the job-ledger attributes `evilflowers.job.id`, `evilflowers.run.id` and
+    `evilflowers.job.delivery`, plus `evilflowers.acquisition.id`, `ocr.engine`, `ocr.language`,
+    `ocr.pages`, `ocr.pages_ocred` and `ocr.outcome`. The acquisition keeps the spelling the dashboards
+    use; the kit's canonical one is `evilflowers.acquisition_id` (an open question in its architecture doc).
 - **Metrics:**
-  - `ocr_pages_total{outcome,engine}`
-  - `ocr_duration_seconds{engine,outcome}`
-  - `ocr_job_outcome_total{job="ocr",outcome}`, outcome files written (the evilflowers-worker kit's name)
-  - `ocr_task_duration_seconds`
-  - process CPU and memory
+  - the kit's standard set: `ocr_task_duration_seconds`, `ocr_job_outcome_total{job="ocr",outcome}`
+    (outcome files written) and `ocr_deliveries_capped_total`;
+  - OCR's own: `ocr_pages_total{outcome,engine}` and `ocr_duration_seconds{engine,outcome}`;
+  - process CPU and memory.
 - **Logs:** one JSON object per line, with `level`, `trace_id`, `job_id`, `run_id`, `acquisition_id` and
   `engine`.
 
@@ -204,6 +221,7 @@ Queries: Tempo `{resource.service.name="ocr"}`; Loki `{service_name="ocr"} | jso
 
 ```bash
 uv sync --all-extras                 # Python 3.12; system Tesseract + Ghostscript for the OCR tests
+                                     # evilflowers-worker comes from the commit pinned in [tool.uv.sources]
 uv run pytest -q                     # unit tests and real OCR on generated PDFs
 docker run -d --rm -p 6390:6379 redis:7
 env TEST_REDIS_URL=redis://localhost:6390/15 uv run pytest -q tests/test_worker_e2e.py   # real prefork worker

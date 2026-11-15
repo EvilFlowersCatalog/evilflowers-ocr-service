@@ -1,11 +1,22 @@
 """A real worker (prefork, one child, task events on) against a real Redis, and no catalog at all.
 
-Proves what unit tests cannot: ocrmypdf runs inside a daemonic prefork child, the
-outcome file lands on the shared volume with the run's token, the soft time limit
-stops a long book and turns into a `failed` outcome before the hard kill, and
-SIGTERM mid-OCR hands the message back to Redis without leaving a destination or
-an outcome, so another worker finishes the same run and writes the outcome with
-the same token. Runs only with TEST_REDIS_URL (CI starts a Redis service).
+Proves what unit tests cannot:
+
+- ocrmypdf runs inside a daemonic prefork child, and the outcome file lands on the
+  shared volume with the run's token (issue #5);
+- the soft time limit stops a long book and turns into a `failed` outcome before
+  the hard kill;
+- scale-in under evilflowers-worker's shutdown (issue #6): SIGTERM is warm, the book
+  is cancelled after WORKER_SOFT_SHUTDOWN_TIMEOUT and requeued at once, with no
+  destination and no outcome, its delivery given back. Another worker finishes the
+  same run and writes the outcome with the same token;
+- a PDF that kills its worker on every delivery ends with a `failed` outcome past
+  MAX_DELIVERIES instead of being redelivered forever;
+- an idle worker exits at once on SIGTERM.
+
+Runs only with TEST_REDIS_URL (CI starts a Redis service). The worker's output goes
+to a file, not a pipe (the kit's ``testing.WorkerProcess``): nobody reads a pipe while
+a book is OCR'd, and a full pipe blocks the worker.
 """
 
 import json
@@ -18,11 +29,14 @@ import uuid
 from pathlib import Path
 
 import pytest
+from evilflowers_worker.deliveries import DeliveryCounter
+from evilflowers_worker.testing import assert_outcome
 
 from conftest import needs_tesseract, write_scanned
 
 REDIS = os.environ.get("TEST_REDIS_URL")
-SOFT_SHUTDOWN = 2.0
+GRACE = 2.0
+CANCEL = 3.0
 pytestmark = [
     pytest.mark.skipif(not REDIS, reason="TEST_REDIS_URL is not set"),
     pytest.mark.ocr,
@@ -52,13 +66,17 @@ class Run:
         return json.loads(self.outcome_path.read_text()) if self.outcome_path.exists() else None
 
 
-@pytest.fixture
-def queue():
+def redis_client():
     import redis
 
+    return redis.Redis.from_url(REDIS)
+
+
+@pytest.fixture
+def queue():
     name = f"ocr-test-{uuid.uuid4().hex[:8]}"
     yield name
-    redis.Redis.from_url(REDIS).delete(name)
+    redis_client().delete(name)
 
 
 def start_worker(storage: Path, queue: str, scratch: Path, **env) -> subprocess.Popen:
@@ -70,14 +88,12 @@ def start_worker(storage: Path, queue: str, scratch: Path, **env) -> subprocess.
         "STORAGE_PATH": str(storage),
         "TMPDIR": str(scratch),
         "LOG_FORMAT": "text",
-        "REMAP_SIGTERM": "SIGQUIT",
-        "WORKER_SOFT_SHUTDOWN_TIMEOUT": str(SOFT_SHUTDOWN),
+        "WORKER_SOFT_SHUTDOWN_TIMEOUT": str(GRACE),
+        "WORKER_CANCEL_TIMEOUT": str(CANCEL),
         **env,
     }
-    environment.pop("CATALOG_API_KEY", None)
-    environment.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
-    environment.pop("HOST_IP", None)
-    # A file, not a pipe: nobody reads a pipe while the worker runs, and a full pipe blocks the worker.
+    for name in ("CATALOG_API_KEY", "REMAP_SIGTERM", "OTEL_EXPORTER_OTLP_ENDPOINT", "HOST_IP"):
+        environment.pop(name, None)
     log = (scratch.parent / f"{scratch.name}.log").open("w")
     worker = subprocess.Popen(
         [
@@ -135,11 +151,26 @@ def wait_for(condition, timeout: float, what: str) -> None:
         time.sleep(0.1)
 
 
-def queued_ids(queue: str) -> list[str]:
-    import redis
+def queued(queue: str) -> list[dict]:
+    return [json.loads(raw) for raw in redis_client().lrange(queue, 0, -1)]
 
-    client = redis.Redis.from_url(REDIS)
-    return [json.loads(raw)["headers"]["id"] for raw in client.lrange(queue, 0, -1)]
+
+def queued_kwargs(message: dict) -> dict:
+    import base64
+
+    _args, kwargs, _embed = json.loads(base64.b64decode(message["body"]))
+    return kwargs
+
+
+def pool_children(worker: subprocess.Popen) -> list[int]:
+    """The prefork children of the worker (not billiard's semaphore tracker, which macOS runs beside them)."""
+    found = subprocess.run(["ps", "-ax", "-o", "pid=,ppid=,command="], capture_output=True, text=True, check=True)
+    children = []
+    for line in found.stdout.splitlines():
+        pid, ppid, command = line.split(None, 2)
+        if int(ppid) == worker.pid and "semaphore_tracker" not in command:
+            children.append(int(pid))
+    return children
 
 
 def test_prefork_worker_ocrs_and_writes_the_outcome(storage, tmp_path, queue):
@@ -155,10 +186,9 @@ def test_prefork_worker_ocrs_and_writes_the_outcome(storage, tmp_path, queue):
         log = stop(worker)
 
     assert body, f"no outcome file; worker log:\n{log}"
-    assert (body["run_id"], body["token"], body["status"]) == (run.id, run.token, "done"), body
+    assert_outcome(storage, run.outcome, run_id=run.id, token=run.token, status="done", after=run.destination)
     assert (body["pages"], body["pages_ocred"]) == (2, 2)
     assert body["output"] == run.destination
-    assert (storage / run.destination).is_file()
     assert run.token not in log, "the token is never logged"
 
 
@@ -183,7 +213,7 @@ def test_soft_time_limit_stops_a_long_book_before_the_hard_kill(storage, tmp_pat
     assert not (storage / run.destination).exists()
 
 
-def test_sigterm_mid_ocr_requeues_and_the_redelivery_writes_the_outcome(storage, tmp_path, queue):
+def test_scale_in_mid_book_requeues_at_once_and_the_redelivery_writes_the_outcome(storage, tmp_path, queue):
     write_scanned(storage / "catalogs/c/e/book.pdf", pages=40)
     run = Run(storage, "catalogs/c/e/book.pdf")
     destination = storage / "catalogs/c/e/ocr"
@@ -196,15 +226,20 @@ def test_sigterm_mid_ocr_requeues_and_the_redelivery_writes_the_outcome(storage,
         wait_for(lambda: any(scratch.glob(f"ocr-{run.id}-*")), 60, "OCR to start")
         stopped = time.monotonic()
         first.send_signal(signal.SIGTERM)
-        first.wait(timeout=SOFT_SHUTDOWN + 20)
-        took = time.monotonic() - stopped
+        wait_for(lambda: len(queued(queue)) == 1, GRACE + CANCEL + 15, "the book back on the queue")
+        requeued_after = time.monotonic() - stopped
+        first.wait(timeout=GRACE + CANCEL + 20)
     finally:
         log = stop(first)
 
-    assert took < SOFT_SHUTDOWN + 15, log
+    assert requeued_after < GRACE + CANCEL + 10, log
     assert not run.outcome_path.exists(), "an interrupted run must not write an outcome"
     assert not list(destination.glob("*.pdf")), "no destination after SIGTERM"
-    assert queued_ids(queue) == [run.id], f"the message must be back in the queue; log:\n{log}"
+    (message,) = queued(queue)
+    assert message["headers"]["id"] == run.id
+    assert queued_kwargs(message)["token"] == run.token
+    # A deliberate requeue gives its delivery back: stopping a pod never counts towards the cap.
+    assert not redis_client().exists(DeliveryCounter(None, prefix="ocr").key(run.id)), log
 
     second = start_worker(storage, queue, tmp_path / "scratch2")
     try:
@@ -217,3 +252,40 @@ def test_sigterm_mid_ocr_requeues_and_the_redelivery_writes_the_outcome(storage,
     assert body["pages_ocred"] == 40
     assert (storage / body["output"]).is_file()
     assert not [path for path in destination.iterdir() if path.name.endswith(".partial")]
+
+
+def test_a_pdf_that_kills_its_worker_ends_failed_past_the_cap(storage, tmp_path, queue):
+    """The first delivery is killed (an OOM, as far as the parent can tell); past MAX_DELIVERIES=1 it gives up."""
+    write_scanned(storage / "catalogs/c/e/book.pdf", pages=40)
+    run = Run(storage, "catalogs/c/e/book.pdf")
+    scratch = tmp_path / "scratch"
+    worker = start_worker(storage, queue, scratch, MAX_DELIVERIES="1")
+    try:
+        send(queue, run)
+        wait_for(lambda: any(scratch.glob(f"ocr-{run.id}-*")), 60, "OCR to start")
+        (child,) = pool_children(worker)
+        os.kill(child, signal.SIGKILL)
+        body = run.wait(timeout=90)
+    finally:
+        log = stop(worker)
+
+    assert body, f"the cap never wrote an outcome; worker log:\n{log}"
+    assert (body["status"], body["token"]) == ("failed", run.token), body
+    assert body["error"].startswith("gave up after 1 deliveries"), body
+    assert not (storage / run.destination).exists()
+    assert queued(queue) == [], "acknowledged: never delivered again"
+
+
+def test_an_idle_worker_exits_at_once(storage, tmp_path, queue):
+    worker = start_worker(storage, queue, tmp_path / "scratch")
+    try:
+        wait_for(lambda: "ready" in worker.log_path.read_text(errors="replace"), 60, "the worker to start")
+        sent = time.monotonic()
+        worker.send_signal(signal.SIGTERM)
+        code = worker.wait(timeout=20)
+        took = time.monotonic() - sent
+    finally:
+        log = stop(worker)
+
+    assert code == 0, log
+    assert took < GRACE + 5, f"idle worker took {took:.1f} s"

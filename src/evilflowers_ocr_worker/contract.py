@@ -6,12 +6,13 @@ refused. ``engine`` is this service's extension: the catalog does not send it ye
 and a worker without it falls back to ``OCR_DEFAULT_ENGINE``.
 
 The outcome contract is the catalog's (EvilFlowersCatalog#169): the worker writes
-``OutcomeFile`` as JSON at ``outcome``, the catalog reads it on the Celery event
+``OcrOutcome`` as JSON at ``outcome``, the catalog reads it on the Celery event
 (or on its reconcile tick) and applies it if ``run_id`` and ``token`` match the run.
 """
 
 from typing import Literal
 
+from evilflowers_worker.outcome import OutcomeFile
 from pydantic import BaseModel, ConfigDict, Field
 
 OutcomeStatus = Literal["done", "skipped", "failed"]
@@ -43,10 +44,12 @@ class OcrRequest(BaseModel):
     engine: str | None = None
 
 
-class OutcomeFile(BaseModel):
-    """The outcome file. Keys are the catalog's (EvilFlowersCatalog#169); nothing else goes in it."""
+class OcrOutcome(OutcomeFile):
+    """The outcome file: the kit's ``run_id`` / ``token`` / ``status`` plus OCR's fields (EvilFlowersCatalog#169).
 
-    run_id: str
+    The kit's base forbids extra fields, so a misspelt key fails here, not in the catalog.
+    """
+
     token: str = Field(repr=False)
     status: OutcomeStatus
     output: str | None = None

@@ -1,10 +1,12 @@
+"""Logs and span attributes through the kit's observability, configured by `worker` (conftest imports it first)."""
+
 import json
 import logging
 
+from evilflowers_worker.observability import JsonFormatter, bind
 from opentelemetry import trace
 
-from evilflowers_ocr_worker.observability.context import bind
-from evilflowers_ocr_worker.observability.logs import JsonFormatter
+from conftest import SPANS
 
 
 def test_json_line_carries_job_fields_and_trace():
@@ -29,3 +31,21 @@ def test_bound_fields_never_overwrite_reserved_keys():
     assert line["level"] == "warning"
     assert line["message"] == "hello"
     assert line["job_id"] == "j"
+
+
+def test_span_attributes_keep_the_job_ledger_and_dashboard_names():
+    SPANS.clear()
+    with (
+        trace.get_tracer("test").start_as_current_span("probe"),
+        bind(job_id="j", run_id="r", acquisition_id="a", engine="tesseract", language="slk", delivery=2),
+    ):
+        pass
+    (span,) = [span for span in SPANS.get_finished_spans() if span.name == "probe"]
+    assert dict(span.attributes) == {
+        "evilflowers.job.id": "j",
+        "evilflowers.run.id": "r",
+        "evilflowers.acquisition.id": "a",
+        "ocr.engine": "tesseract",
+        "ocr.language": "slk",
+        "evilflowers.job.delivery": 2,
+    }

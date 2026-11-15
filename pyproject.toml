@@ -6,6 +6,9 @@ readme = "README.md"
 authors = [{ name = "Jakub Dubec", email = "jakub.dubec@stuba.sk" }]
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    # The shared worker runtime (issue #6): Celery config, shutdown, delivery cap, outcome files, telemetry.
+    # Pinned to a commit in [tool.uv.sources].
+    "evilflowers-worker",
     "celery[redis]>=5.6,<6",
     # 17.14 is the first release with the built-in RapidOCR engine and `ocr_engine=` selection.
     "ocrmypdf>=17.14,<18",
@@ -13,8 +16,6 @@ dependencies = [
     "pydantic>=2.12,<3",
     "pydantic-settings>=2.6,<3",
     "python-dotenv>=1.0",
-    # The code uses the API only, a no-op without the `otel` extra. One release train with the catalog.
-    "opentelemetry-api==1.45.2",
 ]
 
 [project.optional-dependencies]
@@ -23,12 +24,9 @@ rapidocr = [
     "rapidocr>=3.10,<4",
     "onnxruntime>=1.22",
 ]
-# OTLP/HTTP to the node's Alloy; SDK/exporter 1.x and contrib 0.yb0 move together (as in the catalog).
+# OTLP/HTTP to the node's Alloy: the kit's telemetry extra (SDK, exporter, Celery and system-metrics instrumentation).
 otel = [
-    "opentelemetry-sdk==1.45.2",
-    "opentelemetry-exporter-otlp-proto-http==1.45.2",
-    "opentelemetry-instrumentation-celery==0.66b2",
-    "opentelemetry-instrumentation-system-metrics==0.66b2",
+    "evilflowers-worker[otel]",
 ]
 
 [dependency-groups]
@@ -39,6 +37,10 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.14",
 ]
+
+[tool.uv.sources]
+# evilflowers-worker#3 (catalog jobs: outcome files, RuntimeSettings, run_task). Bump `rev` and `uv lock` to update.
+evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", rev = "c37d860513662adcb85794adabea39af456ffee8" }
 
 [build-system]
 requires = ["hatchling>=1.27"]

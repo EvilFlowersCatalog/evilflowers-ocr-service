@@ -1,8 +1,14 @@
 """Fixtures: PDFs built on the fly (no binary fixtures in the repo) and isolated settings."""
 
 import json
+import os
 import shutil
 from pathlib import Path
+
+# Before the app is created: in-process tests never reach a real broker (the delivery counter fails fast and
+# counts every delivery as the first). The e2e tests start their own worker with TEST_REDIS_URL.
+os.environ["BROKER"] = "redis://127.0.0.1:1/0"
+os.environ.setdefault("LOG_FORMAT", "text")
 
 import pikepdf
 import pytest
@@ -14,6 +20,8 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from PIL import Image, ImageDraw, ImageFont
 
+# First, so the kit's identity is `ocr` before any instrument or span name is resolved (they are cached).
+from evilflowers_ocr_worker import worker  # noqa: F401
 from evilflowers_ocr_worker.settings import Settings
 
 # One SDK provider per process (OpenTelemetry refuses to replace it), recording in memory.

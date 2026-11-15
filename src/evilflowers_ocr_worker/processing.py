@@ -20,7 +20,10 @@ Outcomes: ``done`` (at least one page OCR'd, destination written), ``skipped``
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -29,12 +32,12 @@ from typing import Any
 
 import ocrmypdf
 import pikepdf
+from evilflowers_worker.outcome import PARTIAL_SUFFIX
 from ocrmypdf import exceptions as ocr_errors
 
 from evilflowers_ocr_worker import ocr_hooks
-from evilflowers_ocr_worker.contract import OcrRequest, OutcomeFile
+from evilflowers_ocr_worker.contract import OcrOutcome, OcrRequest
 from evilflowers_ocr_worker.engines import Engine, EngineError, get_engine
-from evilflowers_ocr_worker.outcome import PARTIAL_SUFFIX, atomic_write, remove
 from evilflowers_ocr_worker.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -59,9 +62,9 @@ class Outcome:
     #: The exception behind a `failed` outcome; re-raised by the task so the job keeps the traceback.
     exception: BaseException | None = field(default=None, repr=False)
 
-    def file(self, run_id: str, token: str) -> OutcomeFile:
+    def file(self, run_id: str, token: str) -> OcrOutcome:
         """The outcome file's contents (EvilFlowersCatalog#169)."""
-        return OutcomeFile(
+        return OcrOutcome(
             run_id=run_id,
             token=token,
             status=self.status,  # type: ignore[arg-type]
@@ -148,7 +151,7 @@ def _run(request: OcrRequest, settings: Settings, run_id: str, deadline: float |
         return Outcome("failed", error=f"not a readable PDF: {error}", exception=error, **base)
 
     # A previous delivery killed mid-copy may have left a partial file; it is ours to remove.
-    remove(_partial_path(destination, run_id))
+    _remove(_partial_path(destination, run_id))
 
     # -- OCR ------------------------------------------------------------------------------------------------
     with tempfile.TemporaryDirectory(prefix=f"ocr-{run_id}-", dir=settings.tmp_dir) as scratch:
@@ -236,5 +239,34 @@ def _partial_path(destination: Path, run_id: str) -> Path:
 
 
 def _publish(output: Path, destination: Path, run_id: str) -> None:
-    """Copy onto the shared volume under a temporary name, fsync, rename: never a half-written destination."""
-    atomic_write(destination, output, partial=_partial_path(destination, run_id))
+    """Copy onto the shared volume under a temporary name, fsync, rename: never a half-written destination.
+
+    The same protocol as the kit's ``outcome.atomic_write``, but streamed: that one takes ``bytes``, and an
+    OCR'd book can be hundreds of megabytes. The outcome file itself goes through the kit (``jobs``).
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = _partial_path(destination, run_id)
+    try:
+        with output.open("rb") as reader, partial.open("wb") as writer:
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(partial, destination)
+    except BaseException:
+        _remove(partial)
+        raise
+    _fsync_directory(destination.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    with contextlib.suppress(OSError):
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _remove(path: Path) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()

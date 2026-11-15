@@ -1,14 +1,23 @@
-"""The run end to end (issue #5): what lands in the outcome file, what is kept, what is raised."""
+"""The run end to end (issues #5, #6): what lands in the outcome file, what is kept, what is raised."""
 
 import ast
 from pathlib import Path
 
 import pytest
+from evilflowers_worker import outcome
 
 from conftest import TOKEN, kwargs, needs_tesseract, read_outcome, write_born_digital, write_encrypted, write_scanned
-from evilflowers_ocr_worker import jobs, outcome
+from evilflowers_ocr_worker import jobs, processing
+from evilflowers_ocr_worker.contract import OcrRequest
 
 TASK_ID = "22222222-2222-2222-2222-222222222222"
+
+
+def run(args: dict, settings):
+    """What `tasks.ocr` does once `run_task` has validated the kwargs."""
+    return jobs.run(OcrRequest.model_validate(args), TASK_ID, settings)
+
+
 FIELDS = {
     "run_id",
     "token",
@@ -50,7 +59,7 @@ def test_done_writes_destination_then_the_outcome(settings, storage, monkeypatch
             order.append(Path(target).relative_to(root).as_posix())
 
     monkeypatch.setattr(outcome.os, "replace", spy)
-    result = jobs.run(TASK_ID, args, settings)
+    result = run(args, settings)
 
     assert order == [args["destination"], args["outcome"]], "the outcome file is the commit marker: last"
     written = read_outcome(storage, args)
@@ -79,7 +88,7 @@ def test_skipped_writes_the_outcome_and_no_destination(settings, storage):
     args = kwargs()
     write_born_digital(storage / args["source"])
 
-    result = jobs.run(TASK_ID, args, settings)
+    result = run(args, settings)
 
     written = read_outcome(storage, args)
     assert set(written) == FIELDS
@@ -96,7 +105,7 @@ def test_failed_writes_the_outcome_then_raises(settings, storage, tmp_path):
     write_encrypted(storage / args["source"], tmp_path)
 
     with pytest.raises(jobs.OcrFailed, match="encrypted") as raised:
-        jobs.run(TASK_ID, args, settings)
+        run(args, settings)
 
     written = read_outcome(storage, args)
     assert set(written) == FIELDS
@@ -112,7 +121,7 @@ def test_processing_crash_writes_a_failed_outcome(settings, storage, monkeypatch
 
     monkeypatch.setattr(jobs.processing, "run", boom)
     with pytest.raises(jobs.OcrFailed, match="disk on fire"):
-        jobs.run(TASK_ID, kwargs(), settings)
+        run(kwargs(), settings)
     assert read_outcome(storage, kwargs())["status"] == "failed"
 
 
@@ -124,7 +133,7 @@ def test_soft_time_limit_writes_a_timeout(settings, storage, monkeypatch):
 
     monkeypatch.setattr(jobs.processing, "run", slow)
     with pytest.raises(jobs.OcrFailed, match="time limit"):
-        jobs.run(TASK_ID, kwargs(), settings)
+        run(kwargs(), settings)
     assert "time limit" in read_outcome(storage, kwargs())["error"]
 
 
@@ -136,7 +145,7 @@ def test_interrupted_run_writes_no_outcome(settings, storage, monkeypatch):
 
     monkeypatch.setattr(jobs.processing, "run", terminated)
     with pytest.raises(SystemExit):
-        jobs.run(TASK_ID, kwargs(), settings)
+        run(kwargs(), settings)
     assert outcome_files(storage) == []
 
 
@@ -155,7 +164,7 @@ def test_crash_between_destination_and_outcome_leaves_no_outcome(settings, stora
 
     monkeypatch.setattr(outcome.os, "replace", crash_on_outcome)
     with pytest.raises(OSError, match="node lost power"):
-        jobs.run(TASK_ID, args, settings)
+        run(args, settings)
 
     assert outcome_files(storage) == []
     assert not leftovers(storage)
@@ -166,8 +175,8 @@ def test_crash_between_destination_and_outcome_leaves_no_outcome(settings, stora
 def test_redelivery_overwrites_its_own_outcome(settings, storage):
     args = kwargs()
     write_born_digital(storage / args["source"])
-    jobs.run(TASK_ID, args, settings)
-    jobs.run(TASK_ID, args, settings)
+    run(args, settings)
+    run(args, settings)
     assert outcome_files(storage) == [storage / args["outcome"]]
     assert read_outcome(storage, args)["token"] == TOKEN
 
@@ -176,23 +185,113 @@ def test_redelivery_overwrites_its_own_outcome(settings, storage):
 def test_unknown_kwargs_and_an_old_report_url_are_ignored(settings, storage):
     args = kwargs(priority=5, something_new={"a": 1}, report_url="http://catalog.test/report")
     write_born_digital(storage / args["source"])
-    assert jobs.run(TASK_ID, args, settings)["status"] == "skipped"
+    assert run(args, settings)["status"] == "skipped"
+
+
+# -- Through the task (`runtime.run_task`) -----------------------------------------------------------------------
+
+
+@pytest.fixture
+def task(settings, monkeypatch):
+    """`tasks.ocr`, applied in-process, against the test's settings."""
+    from evilflowers_ocr_worker import tasks
+
+    monkeypatch.setattr(jobs, "get_settings", lambda: settings)
+    return tasks.ocr
+
+
+class Deliveries:
+    """Stands in for the kit's Redis delivery counter: every delivery is number ``count``."""
+
+    def __init__(self, count: int):
+        self.count = count
+
+    def record(self, _task_id, *, redelivered):
+        return self.count
+
+    def forget(self, _task_ids):
+        pass
+
+
+@pytest.fixture
+def delivery(monkeypatch):
+    from evilflowers_worker import runtime
+
+    def set_count(count: int):
+        monkeypatch.setattr(runtime, "_runtime", runtime.Runtime("ocr", runtime.runtime().settings, Deliveries(count)))
+
+    return set_count
 
 
 @pytest.mark.parametrize("missing", ["source", "outcome", "token"])
-def test_missing_kwargs_are_a_contract_error(settings, storage, missing):
+def test_missing_kwargs_are_a_contract_error(task, storage, missing):
     args = kwargs()
     del args[missing]
     with pytest.raises(jobs.InvalidRequest, match=missing):
-        jobs.run(TASK_ID, args, settings)
+        task.apply(kwargs=args, task_id=TASK_ID, throw=True)
     assert outcome_files(storage) == []
 
 
-def test_contract_error_does_not_leak_the_token(settings):
-    args = kwargs(language=None)
-    with pytest.raises(jobs.InvalidRequest) as raised:
-        jobs.run(TASK_ID, args, settings)
+def test_contract_error_does_not_leak_the_token(task, caplog):
+    with caplog.at_level("DEBUG"), pytest.raises(jobs.InvalidRequest) as raised:
+        task.apply(kwargs=kwargs(language=None), task_id=TASK_ID, throw=True)
     assert TOKEN not in str(raised.value)
+    assert TOKEN not in caplog.text
+
+
+@needs_tesseract
+def test_the_task_writes_the_outcome(task, storage, delivery):
+    delivery(1)
+    args = kwargs()
+    write_born_digital(storage / args["source"])
+    result = task.apply(kwargs=args, task_id=TASK_ID, throw=True).get()
+    assert result["status"] == "skipped"
+    assert read_outcome(storage, args)["token"] == TOKEN
+
+
+def test_past_the_delivery_cap_a_failed_outcome_is_written_and_the_task_raises(task, settings, storage, delivery):
+    """A PDF that OOMs the worker on every delivery ends `failed`, instead of being redelivered forever."""
+    delivery(settings.max_deliveries + 1)
+    args = kwargs()
+    write_scanned(storage / args["source"])
+
+    with pytest.raises(jobs.GaveUp, match=f"gave up after {settings.max_deliveries} deliveries"):
+        task.apply(kwargs=args, task_id=TASK_ID, throw=True)
+
+    written = read_outcome(storage, args)
+    assert (written["status"], written["run_id"], written["token"]) == ("failed", args["run_id"], TOKEN)
+    assert written["error"].startswith(f"gave up after {settings.max_deliveries} deliveries")
+    assert not (storage / args["destination"]).exists(), "no OCR past the cap"
+
+
+def test_at_the_cap_the_book_is_still_ocred(task, settings, monkeypatch, delivery):
+    delivery(settings.max_deliveries)
+    calls = []
+    monkeypatch.setattr(jobs, "run", lambda request, task_id: calls.append(task_id) or {"status": "done"})
+    task.apply(kwargs=kwargs(), task_id=TASK_ID, throw=True)
+    assert calls == [TASK_ID]
+
+
+def test_task_options_keep_late_ack_and_the_hard_limit():
+    """The kit's CeleryConfig sets none of these: without them the task acks early and loses the book on an OOM."""
+    from evilflowers_ocr_worker import tasks
+    from evilflowers_ocr_worker.settings import Settings
+
+    task = tasks.ocr
+    assert task.name == "evilflowers_ocr_worker.ocr"
+    assert task.acks_late is True
+    assert task.reject_on_worker_lost is True
+    assert task.time_limit == Settings(_env_file=None).task_time_limit
+    assert task.soft_time_limit is None, "the soft limit is the run's own deadline, not Celery's"
+
+
+def test_no_local_copy_of_the_runtime():
+    """Issue #6: observability, the Celery config and the outcome writer come from evilflowers-worker."""
+    assert not list((SOURCE / "observability").glob("*.py"))
+    assert not (SOURCE / "outcome.py").exists()
+    assert not hasattr(__import__("evilflowers_ocr_worker.worker").worker, "CeleryConfig")
+    assert processing.PARTIAL_SUFFIX == outcome.PARTIAL_SUFFIX
+    assert "REMAP_SIGTERM=" not in (SOURCE.parents[1] / "Dockerfile").read_text()
 
 
 @pytest.mark.parametrize(
@@ -207,14 +306,14 @@ def test_contract_error_does_not_leak_the_token(settings):
 def test_bad_outcome_path_is_refused_before_ocr(settings, storage, monkeypatch, path):
     monkeypatch.setattr(jobs.processing, "run", lambda *_a, **_k: pytest.fail("OCR must not start"))
     with pytest.raises(jobs.InvalidRequest, match="outcome"):
-        jobs.run(TASK_ID, kwargs(outcome=path), settings)
+        run(kwargs(outcome=path), settings)
 
 
 def test_the_token_is_not_in_the_result_or_the_logs(settings, storage, caplog):
     args = kwargs()
     write_born_digital(storage / args["source"])
     with caplog.at_level("DEBUG"):
-        result = jobs.run(TASK_ID, args, settings)
+        result = run(args, settings)
     assert TOKEN not in repr(result)
     assert TOKEN not in caplog.text
 

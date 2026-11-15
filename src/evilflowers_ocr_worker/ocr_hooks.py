@@ -38,7 +38,8 @@ from dataclasses import dataclass, field
 
 from ocrmypdf import hookimpl
 
-#: Signals that stop the run: pod termination (TERM; QUIT with REMAP_SIGTERM), Ctrl+C, billiard's soft limit.
+#: Signals that stop the run: the kit's cold cancel (billiard terminates the child: TERM; QUIT), Ctrl+C,
+#: billiard's soft limit.
 STOP_SIGNALS = tuple(
     sig for sig in (getattr(signal, name, None) for name in ("SIGTERM", "SIGINT", "SIGQUIT", "SIGUSR1")) if sig
 )
