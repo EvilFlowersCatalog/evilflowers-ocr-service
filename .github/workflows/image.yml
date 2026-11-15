@@ -174,5 +174,5 @@ jobs:
             echo "Grafana (VPN): http://grafana.observability.stu.k8s.internal → Explore"
             echo "- Tempo: \`{resource.service.name=\"ocr\"}\`"
             echo "- Loki: \`{namespace=\"${NAMESPACE}\", service_name=\"ocr\"} | json\`"
-            echo "- Mimir: \`ocr_pages_total\`, \`ocr_duration_seconds_bucket\`, \`ocr_reports_total\`"
+            echo "- Mimir: \`ocr_pages_total\`, \`ocr_duration_seconds_bucket\`, \`ocr_job_outcome_total\`"
           } >> "$GITHUB_STEP_SUMMARY"

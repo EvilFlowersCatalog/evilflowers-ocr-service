@@ -8,8 +8,8 @@ evilflowers_ocr_worker.ocr ``OCR_QUEUE``                the catalog, job kind ``
 
 ``-E`` is required: the catalog builds the job's status from task events
 (received, started, succeeded, failed, revoked); without them jobs stay queued and
-become ``stale``. Nobody waits for a task's result (the task reports to the
-catalog), so there is no result backend.
+become ``stale``. The events are also what makes the catalog read the run's outcome
+file. Nobody waits for a task's result, so there is no result backend.
 """
 
 from celery import Celery
@@ -39,13 +39,13 @@ class CeleryConfig:
         self.task_routes = {f"{TASK_PREFIX}.*": {"queue": settings.queue}}
         self.worker_prefetch_multiplier = 1
         # A worker that dies mid-book (OOM, node drain) gets the message redelivered. The task
-        # writes only its own `destination`, atomically, so a second delivery is safe.
+        # writes only its own `destination` and outcome file, atomically, so a second delivery is safe.
         self.task_acks_late = True
         self.task_reject_on_worker_lost = True
         # Only the hard limit, below the catalog's EVILFLOWERS_OCR_TIME_LIMIT (default 4 h). The soft limit
         # (TASK_SOFT_TIME_LIMIT) is the run's own deadline, enforced between pages by ocr_hooks: Celery's
         # asynchronous SoftTimeLimitExceeded is absorbed by ocrmypdf's thread pool, and could otherwise land in
-        # the middle of the report.
+        # the middle of writing the outcome file.
         self.task_time_limit = settings.task_time_limit
         # Safe scale-in: with REMAP_SIGTERM=SIGQUIT, SIGTERM is a cold shutdown that waits this long,
         # then hands the unacknowledged task back to the queue at once.

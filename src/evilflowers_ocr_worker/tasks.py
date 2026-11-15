@@ -9,6 +9,6 @@ TASK_NAME = "evilflowers_ocr_worker.ocr"
 
 @shared_task(bind=True, name=TASK_NAME)
 def ocr(self, *_args, **kwargs):
-    """`files.ocr`: kwargs only (job_id, run_id, acquisition_id, source, destination, language, redo,
-    report_url, and optionally engine). Unknown kwargs are ignored."""
+    """`files.ocr`: kwargs only (job_id, run_id, acquisition_id, source, destination, outcome, token, language,
+    redo, and optionally engine). Unknown kwargs (`report_url` from an older catalog) are ignored."""
     return jobs.run(self.request.id, kwargs)

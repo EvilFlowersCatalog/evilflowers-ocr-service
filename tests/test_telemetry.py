@@ -1,13 +1,10 @@
 """Issue #4 telemetry with an SDK provider on (in-memory exporters from conftest)."""
 
 import pytest
-import responses
 
 from conftest import METRICS, SPANS, kwargs, needs_tesseract, write_scanned
 from evilflowers_ocr_worker import jobs
 from evilflowers_ocr_worker.observability import setup
-
-URL = kwargs()["report_url"]
 
 
 def metric_points() -> dict[str, list]:
@@ -22,12 +19,10 @@ def metric_points() -> dict[str, list]:
 
 @pytest.mark.ocr
 @needs_tesseract
-@responses.activate
 def test_ocr_run_span_and_metrics(settings, storage):
     SPANS.clear()
     args = kwargs()
     write_scanned(storage / args["source"], pages=2)
-    responses.post(URL, status=200)
 
     jobs.run("22222222-2222-2222-2222-222222222222", args, settings)
 
@@ -42,11 +37,13 @@ def test_ocr_run_span_and_metrics(settings, storage):
     assert attributes["ocr.pages_ocred"] == 2
 
     points = metric_points()
-    # Exported to Mimir as ocr_pages_total, ocr_duration_seconds, ocr_reports_total.
-    assert {"ocr.pages", "ocr.duration", "ocr.reports"} <= set(points)
+    # Exported to Mimir as ocr_pages_total, ocr_duration_seconds, ocr_job_outcome_total.
+    assert {"ocr.pages", "ocr.duration", "ocr.job.outcome"} <= set(points)
+    assert "ocr.reports" not in points
     pages = {tuple(sorted(p.attributes.items())): p.value for p in points["ocr.pages"]}
     assert pages[(("engine", "tesseract"), ("outcome", "ocred"))] >= 2
-    assert any(dict(p.attributes) == {"status": "200"} for p in points["ocr.reports"])
+    assert any(dict(p.attributes) == {"job": "ocr", "outcome": "done"} for p in points["ocr.job.outcome"])
+    assert all(args["token"] not in str(value) for value in attributes.values())
 
 
 def test_failed_run_counts_pages_as_failed():

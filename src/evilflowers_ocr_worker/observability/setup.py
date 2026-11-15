@@ -11,8 +11,7 @@ The contract is the cluster's (knowledge note Deploy-a-Service §3):
 - CPU profiles come from pyroscope.ebpf, nothing to do here.
 
 Instrumented once the providers are up: every task (CONSUMER span, continuing the
-catalog's trace from the task headers), every ``requests`` call (the report: a
-CLIENT span carrying ``traceparent``), process metrics. Redis is not instrumented:
+catalog's trace from the task headers) and process metrics. Redis is not instrumented:
 the broker polls it constantly and every poll would become a root trace.
 """
 
@@ -101,7 +100,6 @@ def _configure() -> None:
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.instrumentation.celery import CeleryInstrumentor
-    from opentelemetry.instrumentation.requests import RequestsInstrumentor
     from opentelemetry.instrumentation.system_metrics import SystemMetricsInstrumentor
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
@@ -120,7 +118,6 @@ def _configure() -> None:
     _providers[:] = [tracer_provider, meter_provider]
 
     CeleryInstrumentor().instrument()
-    RequestsInstrumentor().instrument()
     SystemMetricsInstrumentor(config=SYSTEM_METRICS_CONFIG).instrument()
 
 

@@ -20,10 +20,7 @@ Outcomes: ``done`` (at least one page OCR'd, destination written), ``skipped``
 
 from __future__ import annotations
 
-import contextlib
 import logging
-import os
-import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -35,15 +32,15 @@ import pikepdf
 from ocrmypdf import exceptions as ocr_errors
 
 from evilflowers_ocr_worker import ocr_hooks
-from evilflowers_ocr_worker.contract import OcrReport, OcrRequest
+from evilflowers_ocr_worker.contract import OcrRequest, OutcomeFile
 from evilflowers_ocr_worker.engines import Engine, EngineError, get_engine
+from evilflowers_ocr_worker.outcome import PARTIAL_SUFFIX, atomic_write, remove
 from evilflowers_ocr_worker.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-#: ocrmypdf warnings kept in the report, at most.
+#: ocrmypdf warnings kept in the outcome file, at most.
 MAX_WARNINGS = 20
-PARTIAL_SUFFIX = ".partial"
 
 
 @dataclass
@@ -62,8 +59,11 @@ class Outcome:
     #: The exception behind a `failed` outcome; re-raised by the task so the job keeps the traceback.
     exception: BaseException | None = field(default=None, repr=False)
 
-    def report(self) -> OcrReport:
-        return OcrReport(
+    def file(self, run_id: str, token: str) -> OutcomeFile:
+        """The outcome file's contents (EvilFlowersCatalog#169)."""
+        return OutcomeFile(
+            run_id=run_id,
+            token=token,
             status=self.status,  # type: ignore[arg-type]
             output=self.output,
             pages=self.pages,
@@ -71,21 +71,28 @@ class Outcome:
             skipped_reason=self.skipped_reason,
             error=self.error,
             warnings=self.warnings,
+            engine=self.engine,
+            engine_version=self.engine_version,
+            language=self.language,
+            seconds=round(self.seconds, 3),
         )
 
     def result(self) -> dict[str, Any]:
-        """The task's return value: the report plus what the report body may not carry."""
+        """The task's return value, kept compact: Celery's event carries a repr capped at 1024 characters.
+
+        The full outcome (warnings, errors) lives in the outcome file.
+        """
         return {
-            **self.report().body(),
+            "status": self.status,
+            "pages": self.pages,
+            "pages_ocred": self.pages_ocred,
             "engine": self.engine,
-            "engine_version": self.engine_version,
-            "language": self.language,
             "seconds": round(self.seconds, 3),
         }
 
 
 class _WarningCollector(logging.Handler):
-    """Keeps ocrmypdf's warnings (from every worker thread) for the report."""
+    """Keeps ocrmypdf's warnings (from every worker thread) for the outcome file."""
 
     def __init__(self) -> None:
         super().__init__(level=logging.WARNING)
@@ -141,7 +148,7 @@ def _run(request: OcrRequest, settings: Settings, run_id: str, deadline: float |
         return Outcome("failed", error=f"not a readable PDF: {error}", exception=error, **base)
 
     # A previous delivery killed mid-copy may have left a partial file; it is ours to remove.
-    _remove(_partial_path(destination, run_id))
+    remove(_partial_path(destination, run_id))
 
     # -- OCR ------------------------------------------------------------------------------------------------
     with tempfile.TemporaryDirectory(prefix=f"ocr-{run_id}-", dir=settings.tmp_dir) as scratch:
@@ -155,7 +162,7 @@ def _run(request: OcrRequest, settings: Settings, run_id: str, deadline: float |
                 with ocr_hooks.interruptible(str(output)):
                     _ocrmypdf(source, output, engine, language, request.redo, settings)
             except Exception as error:
-                # Stopping: never report, never ack. The process exits and Redis redelivers the message.
+                # Stopping: no outcome file, never ack. The process exits and Redis redelivers the message.
                 if ocr_hooks.is_aborted(str(output)):
                     raise SystemExit("terminated during OCR") from error
                 # However ocrmypdf surfaces a page that hit the deadline (raised, wrapped, or an exit code),
@@ -230,42 +237,4 @@ def _partial_path(destination: Path, run_id: str) -> Path:
 
 def _publish(output: Path, destination: Path, run_id: str) -> None:
     """Copy onto the shared volume under a temporary name, fsync, rename: never a half-written destination."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    partial = _partial_path(destination, run_id)
-    try:
-        with output.open("rb") as reader, partial.open("wb") as writer:
-            shutil.copyfileobj(reader, writer, length=1024 * 1024)
-            writer.flush()
-            os.fsync(writer.fileno())
-        os.replace(partial, destination)
-    except BaseException:
-        _remove(partial)
-        raise
-    _fsync_directory(destination.parent)
-
-
-def _fsync_directory(directory: Path) -> None:
-    with contextlib.suppress(OSError):
-        fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-
-def _remove(path: Path) -> None:
-    with contextlib.suppress(FileNotFoundError):
-        path.unlink()
-
-
-def remove_output(settings: Settings, destination: str) -> bool:
-    """Delete a written destination (the catalog did not accept it). True if a file was removed."""
-    try:
-        path = settings.storage_file(destination)
-    except ValueError:
-        return False
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return False
-    return True
+    atomic_write(destination, output, partial=_partial_path(destination, run_id))

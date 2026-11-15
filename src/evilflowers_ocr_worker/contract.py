@@ -1,19 +1,25 @@
-"""What the catalog sends (issue #1, IP-031 revision 2) and what the worker reports back (issue #3).
+"""What the catalog sends (issue #1, IP-031 revision 2) and the outcome file the worker writes back (issue #5).
 
 Kwargs only. Unknown kwargs are ignored, so the catalog can add fields without
-breaking an older worker. ``engine`` is this service's extension: the catalog does
-not send it yet, and a worker without it falls back to ``OCR_DEFAULT_ENGINE``.
+breaking an older worker, and a catalog that still sends ``report_url`` is not
+refused. ``engine`` is this service's extension: the catalog does not send it yet,
+and a worker without it falls back to ``OCR_DEFAULT_ENGINE``.
+
+The outcome contract is the catalog's (EvilFlowersCatalog#169): the worker writes
+``OutcomeFile`` as JSON at ``outcome``, the catalog reads it on the Celery event
+(or on its reconcile tick) and applies it if ``run_id`` and ``token`` match the run.
 """
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-ReportStatus = Literal["done", "skipped", "failed"]
+OutcomeStatus = Literal["done", "skipped", "failed"]
 
 
 class OcrRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
+    # hide_input_in_errors: a validation error must not echo the kwargs (and so the token) into the job's error.
+    model_config = ConfigDict(extra="ignore", frozen=True, hide_input_in_errors=True)
 
     #: The job in the catalog's ledger (`/api/v1/jobs/<job_id>`).
     job_id: str
@@ -25,26 +31,31 @@ class OcrRequest(BaseModel):
     source: str
     #: Storage-relative path to write: catalogs/<catalog>/<entry>/ocr/<run_id>.pdf.
     destination: str
+    #: Storage-relative path of the outcome file: catalogs/<catalog>/<entry>/ocr/<run_id>.json.
+    outcome: str
+    #: The run's capability token, minted by the catalog. Opaque here: echoed back in the outcome file, never logged.
+    token: str = Field(repr=False)
     #: ISO 639-2 (alpha3) of the entry, e.g. "slk", "ces", "eng".
     language: str
     #: Redo OCR on pages that already have text (ocrmypdf `redo` mode).
     redo: bool = False
-    #: POST the outcome here.
-    report_url: str | None = None
     #: OCR engine (`tesseract`, `rapidocr`); None: the worker's default.
     engine: str | None = None
 
 
-class OcrReport(BaseModel):
-    """The report body. Keys are the ones the catalog stores; nothing else goes in it."""
+class OutcomeFile(BaseModel):
+    """The outcome file. Keys are the catalog's (EvilFlowersCatalog#169); nothing else goes in it."""
 
-    status: ReportStatus
+    run_id: str
+    token: str = Field(repr=False)
+    status: OutcomeStatus
     output: str | None = None
     pages: int | None = None
     pages_ocred: int | None = None
     skipped_reason: str | None = None
     error: str | None = None
     warnings: list[str] = Field(default_factory=list)
-
-    def body(self) -> dict[str, Any]:
-        return self.model_dump()
+    engine: str | None = None
+    engine_version: str | None = None
+    language: str | None = None
+    seconds: float = 0.0

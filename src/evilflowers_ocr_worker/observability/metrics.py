@@ -2,13 +2,14 @@
 
 Exported over OTLP and stored in Mimir under the Prometheus names of issue #4:
 
-==========================  =================================================================
-Prometheus name             Instrument
-==========================  =================================================================
-ocr_pages_total{outcome}    ``ocr.pages`` counter, pages by outcome (``ocred``, ``skipped``)
-ocr_duration_seconds        ``ocr.duration`` histogram, one OCR run, by engine and outcome
-ocr_reports_total{status}   ``ocr.reports`` counter, report attempts by HTTP status / error
-==========================  =================================================================
+=====================================  ==========================================================
+Prometheus name                        Instrument
+=====================================  ==========================================================
+ocr_pages_total{outcome}               ``ocr.pages`` counter, pages by outcome (``ocred``, ``skipped``)
+ocr_duration_seconds                   ``ocr.duration`` histogram, one OCR run, by engine and outcome
+ocr_job_outcome_total{job,outcome}     ``ocr.job.outcome`` counter, outcome files written, by status.
+                                       The evilflowers-worker kit's standard name (issue #6)
+=====================================  ==========================================================
 
 Attributes stay low-cardinality: never a job or acquisition id (those go on spans and log lines).
 """
@@ -64,7 +65,7 @@ class Instrument:
 
 PAGES = Instrument("counter", "ocr.pages", "{page}", "PDF pages handled, by outcome (ocred, skipped)")
 DURATION = Instrument("histogram", "ocr.duration", "s", "Time to OCR one PDF, by engine and outcome")
-REPORTS = Instrument("counter", "ocr.reports", "{report}", "Report attempts to the catalog, by HTTP status or error")
+JOB_OUTCOMES = Instrument("counter", "ocr.job.outcome", "", "Outcome files written, by job and outcome")
 TASK_DURATION = Instrument("histogram", "ocr.task.duration", "s", "Celery task run time")
 
 
@@ -82,6 +83,6 @@ def record_run(engine: str, outcome: str, seconds: float, pages: int | None, pag
         PAGES.add(pages - (pages_ocred or 0), {"outcome": "skipped", "engine": engine})
 
 
-def record_report(status: str) -> None:
-    """``status``: the HTTP status code, or ``error`` (network)."""
-    REPORTS.add(1, {"status": status})
+def record_outcome(status: str) -> None:
+    """One outcome file written; ``status``: ``done``, ``skipped`` or ``failed``."""
+    JOB_OUTCOMES.add(1, {"job": "ocr", "outcome": status})

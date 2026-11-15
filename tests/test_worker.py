@@ -26,25 +26,27 @@ def test_config_contract():
     assert config.broker_transport_options["visibility_timeout"] > config.task_time_limit
 
 
-def test_soft_to_hard_gap_leaves_room_to_report():
+#: Copying the OCR'd PDF onto the shared volume and writing the outcome file, with room to spare.
+WRITE_ALLOWANCE = 300
+
+
+def test_soft_to_hard_gap_leaves_room_to_write_the_outcome():
     settings = Settings(_env_file=None)
-    report_retries = sum(settings.report_backoff) + settings.report_attempts * settings.catalog_timeout
     gap = settings.task_time_limit - settings.task_soft_time_limit
-    # Worst case after the deadline: the page in flight runs to TESSERACT_TIMEOUT, then the report retries.
-    assert gap > settings.tesseract_timeout + report_retries
+    # Worst case after the deadline: the page in flight runs to TESSERACT_TIMEOUT, then two files are written.
+    assert gap >= settings.tesseract_timeout + WRITE_ALLOWANCE
 
 
 def test_environment_names(monkeypatch):
     monkeypatch.setenv("BROKER", "redis://bridge:6379/7")
     monkeypatch.setenv("STORAGE_PATH", "/srv/data")
-    monkeypatch.setenv("CATALOG_API_KEY", "k")
+    monkeypatch.setenv("CATALOG_API_KEY", "left-over")  # an old deployment's variable is ignored, not refused
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("OCR_ENABLED_ENGINES", '["tesseract"]')
     monkeypatch.setenv("OCR_JOBS", "4")
     settings = Settings(_env_file=None)
     assert settings.redis_url == "redis://bridge:6379/7"
     assert str(settings.storage_path) == "/srv/data"
-    assert settings.catalog_api_key.get_secret_value() == "k"
     assert settings.log_level == "DEBUG"
     assert settings.enabled_engines == ("tesseract",)
     assert settings.ocr_jobs == 4

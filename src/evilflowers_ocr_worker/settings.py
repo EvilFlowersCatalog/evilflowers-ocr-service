@@ -1,15 +1,16 @@
 """Configuration of the worker: one typed object read from the environment (and `.env`).
 
 The variable names are the ones issue #1 fixes (``BROKER``, ``STORAGE_PATH``,
-``CATALOG_API_KEY``, ``LOG_LEVEL``, the ``OTEL_*`` block); ``REDIS_URL`` is accepted
-too, as in the sibling extraction workers.
+``LOG_LEVEL``, the ``OTEL_*`` block); ``REDIS_URL`` is accepted too, as in the
+sibling extraction workers. The worker talks to the catalog only through storage
+and Celery events (issue #5): no catalog URL, no API key.
 """
 
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,12 +22,13 @@ class Settings(BaseSettings):
     redis_url: str = Field("redis://redis:6379/7", validation_alias=AliasChoices("BROKER", "REDIS_URL"))
     #: The catalog's `EVILFLOWERS_OCR_QUEUE`.
     queue: str = Field("evilflowers_ocr_worker", validation_alias=AliasChoices("OCR_QUEUE", "QUEUE"))
-    #: Soft limit: the run's own deadline. ocrmypdf stops between pages, the task reports `failed`
-    #: (timeout). Below the catalog's EVILFLOWERS_OCR_TIME_LIMIT (4 h), after which its sweeper marks
-    #: the job `lost`.
-    task_soft_time_limit: int = 12_600
-    #: Hard limit (Celery kills the child). The gap to the soft limit must exceed one page's worst
-    #: case (TESSERACT_TIMEOUT) plus the report's retries, or a timeout is never reported.
+    #: Soft limit: the run's own deadline. ocrmypdf stops between pages, the task writes a `failed`
+    #: outcome (timeout). Below the catalog's EVILFLOWERS_OCR_TIME_LIMIT (4 h), after which its sweeper
+    #: marks the job `lost`.
+    task_soft_time_limit: int = 13_200
+    #: Hard limit (Celery kills the child). The gap to the soft limit (15 min) must exceed one page's
+    #: worst case (TESSERACT_TIMEOUT, 10 min) plus writing two files (the destination and the outcome,
+    #: allowed 5 min), or a timeout never gets its outcome file.
     task_time_limit: int = 14_100
     #: Seconds before Redis redelivers an unacknowledged message. The task acknowledges late, so this
     #: must outlast the hard time limit. It is shared: the shortest value among a Redis db's consumers
@@ -61,14 +63,6 @@ class Settings(BaseSettings):
     rapidocr_model_dir: Path | None = Field(
         None, validation_alias=AliasChoices("OCRMYPDF_RAPIDOCR_MODEL_DIR", "RAPIDOCR_MODEL_DIR")
     )
-
-    # -- Catalog report (issue #3) ------------------------------------------------------------------------------
-    #: API key (bearer) of the catalog service user holding `tasks.report_job`.
-    catalog_api_key: SecretStr | None = None
-    catalog_timeout: float = 30.0
-    #: Attempts on 5xx or a network error, and the waits between them (~10 min in all).
-    report_attempts: int = Field(5, ge=1)
-    report_backoff: tuple[float, ...] = (30.0, 90.0, 180.0, 300.0)
 
     # -- Logs ---------------------------------------------------------------------------------------------------
     #: `json` (one object per line, what Loki parses) or `text` (Celery's own format, for a terminal).

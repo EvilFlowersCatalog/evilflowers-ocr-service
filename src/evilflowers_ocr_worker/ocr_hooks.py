@@ -9,7 +9,7 @@ Pages counted
 Deadline
     Celery's soft time limit cannot stop ocrmypdf. It raises in the main thread,
     ocrmypdf's thread pool absorbs the exception and goes on OCRing every queued
-    page until the hard limit kills the process, and then no report is sent
+    page until the hard limit kills the process, and then no outcome is written
     (measured: tests/test_worker_e2e.py). So the run carries its own deadline, which
     is checked before every page is rasterised and again before it is OCR'd. Past
     the deadline each remaining page fails at once, and ocrmypdf returns within
@@ -21,8 +21,8 @@ Termination
     page before letting it through, so a pod being stopped would keep OCRing until
     SIGKILL. ``interruptible()`` chains the termination signals while ocrmypdf runs:
     the run is marked aborted, remaining pages fail at once, and the original
-    handler's exception (``SystemExit``) propagates unchanged. No report is sent, and
-    Redis gets the message back (acks_late).
+    handler's exception (``SystemExit``) propagates unchanged. No outcome file is
+    written, and Redis gets the message back (acks_late).
 
 Pages run in ocrmypdf's worker THREADS (``use_threads=True``, forced by
 ``processing``); the state is process memory guarded by a lock, keyed by the run's

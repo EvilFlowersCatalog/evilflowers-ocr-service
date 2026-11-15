@@ -1,5 +1,6 @@
 """Fixtures: PDFs built on the fly (no binary fixtures in the repo) and isolated settings."""
 
+import json
 import shutil
 from pathlib import Path
 
@@ -48,9 +49,6 @@ def settings(storage: Path, tmp_path: Path) -> Settings:
     return Settings(
         storage_path=storage,
         tmp_dir=scratch,
-        catalog_api_key="secret-key",
-        report_attempts=5,
-        report_backoff=(0.0,),
         log_format="text",
         ocr_jobs=1,
         _env_file=None,
@@ -124,9 +122,17 @@ def kwargs(**overrides):
         "acquisition_id": "33333333-3333-3333-3333-333333333333",
         "source": "catalogs/cat/entry/book.pdf",
         "destination": "catalogs/cat/entry/ocr/22222222-2222-2222-2222-222222222222.pdf",
+        "outcome": "catalogs/cat/entry/ocr/22222222-2222-2222-2222-222222222222.json",
+        "token": TOKEN,
         "language": "eng",
         "redo": False,
-        "report_url": "http://catalog.test/api/v1/jobs/runs/22222222-2222-2222-2222-222222222222/report",
     }
     base.update(overrides)
     return base
+
+
+TOKEN = "cap-token-4f1c9a"
+
+
+def read_outcome(storage: Path, args: dict) -> dict:
+    return json.loads((storage / args["outcome"]).read_text())

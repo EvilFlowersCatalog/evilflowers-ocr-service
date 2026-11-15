@@ -9,14 +9,17 @@ the original in place and failed on every born-digital PDF (EvilFlowersCatalog#1
 - **Skips born-digital PDFs.** Pages that already have text are left alone, which is not an error.
 - **Lets the caller choose the OCR engine.** Tesseract is the default; RapidOCR (PaddleOCR models on
   ONNX Runtime) is the alternative.
-- **Reports the outcome** to the catalog, which then replaces the file or adds a derived acquisition, and
-  starts LCP re-encryption and extraction as follow-up jobs.
+- **Writes the outcome to a file** next to the output. The catalog reads it when the Celery event arrives
+  (or on its reconcile tick) and then replaces the file or adds a derived acquisition, and starts LCP
+  re-encryption and extraction as follow-up jobs. The worker needs no catalog URL and no API key.
 
 ```
 catalog ──(Redis db 7, queue evilflowers_ocr_worker)──▶ ocr worker ──▶ ocrmypdf + engine
-   ▲                                                       │  reads  STORAGE_PATH/source
-   │                                                       │  writes STORAGE_PATH/destination (tmp → fsync → rename)
-   └────────── POST /api/v1/jobs/runs/<run_id>/report ◀────┘
+   ▲  ▲                                                    │  reads  STORAGE_PATH/source
+   │  │                                                    │  writes STORAGE_PATH/destination  (tmp → fsync → rename)
+   │  │                                                    │  writes STORAGE_PATH/outcome      (last: the commit marker)
+   │  └──────── task-succeeded / task-failed (-E) ◀────────┤
+   └─────────── reads STORAGE_PATH/outcome ◀───────────────┘
 ```
 
 ## Task contract
@@ -37,62 +40,68 @@ ocr(
     acquisition_id: str,
     source: str,          # storage-relative, read only
     destination: str,     # storage-relative: catalogs/<catalog>/<entry>/ocr/<run_id>.pdf
+    outcome: str,         # storage-relative: catalogs/<catalog>/<entry>/ocr/<run_id>.json
+    token: str,           # the run's capability token (catalog-minted); echoed back, never logged
     language: str,        # ISO 639-2 alpha3 ("slk", "ces", "eng"; B codes like "slo"/"cze" accepted)
     redo: bool,           # true: replace an existing OCR layer (ocrmypdf redo mode)
-    report_url: str,      # POST the outcome here
     engine: str = None,   # optional: "tesseract" | "rapidocr"; None → OCR_DEFAULT_ENGINE
 )
 ```
 
+A message without `outcome` or `token` fails the task at once with a contract error; the worker never falls
+back to an HTTP report. `report_url` from an older catalog is ignored like any other unknown kwarg. An
+`outcome` outside `STORAGE_PATH`, or equal to `source` or `destination`, is refused before OCR starts.
+
 ### Outcomes
 
-| Status | When | Destination |
-|---|---|---|
-| `done` | at least one page was OCR'd | written |
-| `skipped` | every page already has text, or the PDF is tagged or signed (ocrmypdf leaves those alone) | none |
-| `failed` | password-protected, corrupt, missing source, unknown language, engine not available, timeout | none; the task raises after reporting |
+| Status | When | Destination | Outcome file |
+|---|---|---|---|
+| `done` | at least one page was OCR'd | written first | written last |
+| `skipped` | every page already has text, or the PDF is tagged or signed (ocrmypdf leaves those alone) | none | written |
+| `failed` | password-protected, corrupt, missing source, unknown language, engine not available, timeout | none | written, then the task raises |
+| interrupted | SIGTERM / cold shutdown mid-book | none | **none**; the message goes back to Redis |
 
 A language the chosen engine cannot read is `failed`. The worker never silently falls back to English.
 
-### Report
+### Outcome file
 
-`POST {report_url}` with `Authorization: Bearer $CATALOG_API_KEY` and `traceparent`:
+The contract is the catalog's (EvilFlowersCatalog#169). It is written atomically (`.partial`, fsync,
+rename, fsync the directory), **after** `destination`: it is the commit marker. A crash between the two
+leaves no outcome file, so the catalog ends the run `lost` instead of applying it.
 
 ```json
-{"status": "done", "output": "catalogs/…/ocr/<run_id>.pdf", "pages": 214, "pages_ocred": 198,
- "skipped_reason": null, "error": null, "warnings": []}
+{"run_id": "…", "token": "…", "status": "done", "output": "catalogs/…/ocr/<run_id>.pdf",
+ "pages": 214, "pages_ocred": 198, "skipped_reason": null, "error": null, "warnings": [],
+ "engine": "tesseract", "engine_version": "5.5.0", "language": "slk", "seconds": 412.3}
 ```
 
-| Catalog answers | Worker |
-|---|---|
-| 200 | done |
-| 400, 401, 403 | fails the task, no retry |
-| 404 | logs and finishes |
-| 409 (cancelled, or a newer run replaced this one) | **deletes the destination**, finishes |
-| 5xx or a network error | retries 5 times over about 10 min (`REPORT_BACKOFF`), then fails the task |
+The worker never deletes anything it wrote. When a run was revoked or replaced by a newer one, or its
+token is rejected, the catalog deletes `destination` and the outcome file itself.
 
-Only 409 deletes the destination. In every other case the catalog may already have applied an earlier
-attempt whose answer was lost, so deleting the file could break a published book; an orphaned file is the
-cheaper failure.
+An interrupted run must never write a `failed` outcome: that would consume the token, and the catalog
+would refuse the outcome of the redelivery, which carries the same token.
 
 ### Time limits and shutdown
 
-- **`TASK_SOFT_TIME_LIMIT` (3.5 h) is the run's own deadline.** The worker checks it before each page is
-  rasterised and OCR'd, so the run stops within about one page and reports `failed` ("time limit exceeded").
+- **`TASK_SOFT_TIME_LIMIT` (3 h 40 min) is the run's own deadline.** The worker checks it before each page
+  is rasterised and OCR'd, so the run stops within about one page and writes a `failed` outcome ("time limit
+  exceeded").
 - **Celery's soft time limit is not used.** ocrmypdf's thread pool absorbs Celery's asynchronous
-  `SoftTimeLimitExceeded` and keeps OCRing every queued page until the hard kill, so no report would ever be
-  sent (`tests/test_worker_e2e.py` showed this).
-- **`TASK_TIME_LIMIT` (3 h 55 min) is Celery's hard kill.** The gap between the soft and hard limits covers
-  one page's worst case (`TESSERACT_TIMEOUT`) plus the report retries.
+  `SoftTimeLimitExceeded` and keeps OCRing every queued page until the hard kill, so no outcome would ever
+  be written (`tests/test_worker_e2e.py` showed this).
+- **`TASK_TIME_LIMIT` (3 h 55 min) is Celery's hard kill.** The 15-minute gap between the soft and hard
+  limits covers one page's worst case (`TESSERACT_TIMEOUT`, 10 min) plus writing the destination and the
+  outcome file (5 min allowed).
 - **On SIGTERM** (rollout, scale-in; `REMAP_SIGTERM=SIGQUIT` makes it a cold shutdown), the remaining pages
   are abandoned at once:
-  - no report is sent and no destination is written;
+  - no destination and no outcome file are written;
   - the scratch directory is removed;
-  - Redis gets the message back (`acks_late`), so another worker redoes the same run. The test suite
-    checks all of this end to end.
+  - Redis gets the message back (`acks_late`), so another worker redoes the same run with the same token.
+    The test suite checks all of this end to end.
 
-The task's return value becomes the job's `result` in the ledger. It holds the report plus
-`engine`, `engine_version`, `language`, `seconds` and `report` (`accepted`, `conflict`, `not_found`).
+The task's return value becomes the job's `result` in the ledger. It is kept compact (`status`, `pages`,
+`pages_ocred`, `engine`, `seconds`) because Celery's event carries a repr capped at 1024 characters. The
+full outcome lives in the file.
 
 ## OCR engines
 
@@ -160,14 +169,12 @@ Everything comes from the environment (or `.env`, see `.env.sample`).
 |---|---|---|
 | `BROKER` (or `REDIS_URL`) | `redis://redis:6379/7` | Celery broker |
 | `OCR_QUEUE` | `evilflowers_ocr_worker` | |
-| `STORAGE_PATH` | `/mnt/data` | the shared data volume |
-| `CATALOG_API_KEY` | — | catalog service user with `tasks.report_job` |
+| `STORAGE_PATH` | `/mnt/data` | the shared data volume (`source`, `destination`, `outcome`) |
 | `OCR_DEFAULT_ENGINE` | `tesseract` | engine used when the task names none |
 | `OCR_ENABLED_ENGINES` | `["tesseract","rapidocr"]` | engines a caller may choose |
 | `OCR_JOBS` | `1` | pages OCR'd in parallel; **keep it equal to the CPU limit** |
-| `TASK_SOFT_TIME_LIMIT` / `TASK_TIME_LIMIT` | `12600` / `14100` s | run deadline / Celery hard kill; both below the catalog's `EVILFLOWERS_OCR_TIME_LIMIT` (4 h) |
+| `TASK_SOFT_TIME_LIMIT` / `TASK_TIME_LIMIT` | `13200` / `14100` s | run deadline / Celery hard kill; both below the catalog's `EVILFLOWERS_OCR_TIME_LIMIT` (4 h) |
 | `BROKER_VISIBILITY_TIMEOUT` | `43200` s | above the hard limit, and **equal to the other consumers of Redis db 7**; the shortest value wins for everyone (knowledge#30) |
-| `REPORT_ATTEMPTS` / `REPORT_BACKOFF` | `5` / `[30,90,180,300]` | retries on 5xx |
 | `TESSERACT_TIMEOUT` | `600` s | per page |
 | `LOG_LEVEL`, `LOG_FORMAT` | `INFO`, `json` | |
 | `OTEL_*`, `HOST_IP` | — | telemetry stays off without an endpoint (Deploy-a-Service §3) |
@@ -181,12 +188,11 @@ Telemetry follows the knowledge note **Deploy-a-Service**. It starts in the pref
 - **Spans:**
   - the Celery consumer span;
   - `ocr.run`, carrying `evilflowers.job.id`, `evilflowers.run.id`, `evilflowers.acquisition.id`,
-    `ocr.engine`, `ocr.pages`, `ocr.pages_ocred` and `ocr.outcome`;
-  - the report's HTTP client span, which sends `traceparent` so the catalog's span joins the trace.
+    `ocr.engine`, `ocr.pages`, `ocr.pages_ocred` and `ocr.outcome`.
 - **Metrics:**
   - `ocr_pages_total{outcome,engine}`
   - `ocr_duration_seconds{engine,outcome}`
-  - `ocr_reports_total{status}`
+  - `ocr_job_outcome_total{job="ocr",outcome}`, outcome files written (the evilflowers-worker kit's name)
   - `ocr_task_duration_seconds`
   - process CPU and memory
 - **Logs:** one JSON object per line, with `level`, `trace_id`, `job_id`, `run_id`, `acquisition_id` and

@@ -1,29 +1,38 @@
-"""One `files.ocr` run, end to end: validate the kwargs, OCR, report, decide the task's fate.
+"""One `files.ocr` run, end to end: validate the kwargs, OCR, write the outcome file, decide the task's fate.
 
-Order matters (issue #3): the report goes out before the task returns, so the
-catalog usually sees the report before ``task-succeeded``. A ``failed`` outcome is
-reported too and then raised, so the job carries both the domain error and the
-traceback. The task's return value is the report plus the engine and timing; it
-becomes the job's ``result`` in the ledger.
+Order matters (issue #5, EvilFlowersCatalog#169):
 
-The destination is deleted on 409 only (issue #3): the catalog said the job was
-cancelled or a newer run replaced this one, so nothing will ever point at the file.
-Every other non-200 keeps it. After a lost response (the catalog applied the POST
-but the answer timed out) followed by 5xx, the acquisition may already point at
-the file, and deleting it would break a published book. An orphan on the shared
-volume is the cheaper failure.
+1. ``destination`` is written first (``processing``), for a ``done`` run only;
+2. the outcome file is written last, for every status. It is the commit marker: the
+   catalog applies the run when it reads the file on ``task-succeeded`` /
+   ``task-failed``, or on its reconcile tick if the event was lost;
+3. a ``failed`` outcome is written and then raised, so the job carries both the
+   domain error and the traceback.
+
+Never written: an outcome for a run that was interrupted (SIGTERM, cold shutdown,
+``SystemExit`` from ``ocr_hooks``). The message goes back to Redis and the
+redelivery, carrying the same token, writes it. A ``failed`` file would consume
+the token and make the catalog refuse the redelivery's outcome.
+
+The worker never deletes what it wrote: when a run was revoked or replaced, the
+catalog deletes ``destination`` and the outcome file itself.
+
+The return value is compact (status, pages, engine, seconds): Celery puts a repr of
+it, capped at 1024 characters, into the event. The full outcome lives in the file.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from celery.exceptions import SoftTimeLimitExceeded
 from pydantic import ValidationError
 
-from evilflowers_ocr_worker import processing, report
+from evilflowers_ocr_worker import outcome as outcome_file
+from evilflowers_ocr_worker import processing
 from evilflowers_ocr_worker.contract import OcrRequest
 from evilflowers_ocr_worker.observability import metrics
 from evilflowers_ocr_worker.observability.context import bind
@@ -39,7 +48,7 @@ class InvalidRequest(ValueError):
 
 
 class OcrFailed(RuntimeError):
-    """The OCR outcome is `failed`; raised after the report so the Celery task fails."""
+    """The OCR outcome is `failed`; raised after the outcome file is written so the Celery task fails."""
 
 
 def run(task_id: str | None, kwargs: dict[str, Any], settings: Settings | None = None) -> dict[str, Any]:
@@ -48,6 +57,8 @@ def run(task_id: str | None, kwargs: dict[str, Any], settings: Settings | None =
         request = OcrRequest.model_validate(kwargs)
     except ValidationError as error:
         raise InvalidRequest(f"task kwargs do not match the files.ocr contract: {error}") from error
+    # Before any OCR: a run whose outcome has nowhere to go would only burn CPU.
+    outcome_path = _outcome_path(request, settings)
 
     run_id = request.run_id or task_id or request.job_id
     if request.run_id and task_id and request.run_id != task_id:
@@ -69,49 +80,45 @@ def run(task_id: str | None, kwargs: dict[str, Any], settings: Settings | None =
         metrics.record_run(
             outcome.engine or "unknown", outcome.status, outcome.seconds, outcome.pages, outcome.pages_ocred
         )
-        result = outcome.result()
-        result["report"] = _deliver(request, outcome, settings)
+        outcome_file.write_outcome(outcome_path, outcome.file(run_id, request.token))
+        metrics.record_outcome(outcome.status)
 
         if outcome.status == "failed":
-            logger.error("OCR failed: %s", outcome.error)
+            logger.error("OCR failed: %s (outcome: %s)", outcome.error, request.outcome)
             raise OcrFailed(outcome.error or "OCR failed") from outcome.exception
-        logger.info("OCR %s (report: %s)", outcome.status, result["report"])
-        return result
+        logger.info("OCR %s (outcome: %s)", outcome.status, request.outcome)
+        return outcome.result()
+
+
+def _outcome_path(request: OcrRequest, settings: Settings) -> Path:
+    try:
+        path = settings.storage_file(request.outcome)
+    except ValueError as error:
+        raise InvalidRequest(f"outcome: {error}") from error
+    for name in ("source", "destination"):
+        try:
+            other = settings.storage_file(getattr(request, name))
+        except ValueError:
+            continue  # processing reports a bad source / destination as a `failed` outcome
+        if path == other:
+            raise InvalidRequest(f"outcome equals {name}: {request.outcome!r}")
+    return path
 
 
 def _process(request: OcrRequest, settings: Settings, run_id: str) -> Outcome:
     engine = request.engine or settings.default_engine
-    # The run's own deadline (see ocr_hooks): stops ocrmypdf between pages, leaving time to report
-    # before Celery's hard limit kills the process.
+    # The run's own deadline (see ocr_hooks): stops ocrmypdf between pages, leaving time to write
+    # the outcome before Celery's hard limit kills the process.
     deadline = time.monotonic() + settings.task_soft_time_limit
     try:
         return processing.run(request, settings, run_id, deadline=deadline)
     except SoftTimeLimitExceeded as error:
         message = f"time limit exceeded ({settings.task_soft_time_limit} s)"
         return Outcome("failed", error=message, engine=engine, exception=error)
+    # Exception only: SystemExit (an interrupted run) must propagate and never become a `failed` outcome.
     except Exception as error:
         logger.exception("OCR crashed")
         return Outcome("failed", error=f"{type(error).__name__}: {error}", engine=engine, exception=error)
-
-
-def _deliver(request: OcrRequest, outcome: Outcome, settings: Settings) -> str:
-    if not request.report_url:
-        logger.error("No report_url in the task; the catalog will not apply this run")
-        return "not_sent"
-    try:
-        delivery = report.send(request.report_url, outcome.report().body(), settings)
-    except (report.ReportRejected, report.CatalogUnavailable):
-        if outcome.output:
-            logger.error("Report not accepted; %s stays on the volume for an operator", outcome.output)
-        raise
-    if delivery is report.Delivery.CONFLICT:
-        _discard(outcome, settings, "the job was cancelled or replaced by a newer run (409)")
-    return delivery.value
-
-
-def _discard(outcome: Outcome, settings: Settings, why: str) -> None:
-    if outcome.output and processing.remove_output(settings, outcome.output):
-        logger.warning("Deleted %s: %s", outcome.output, why)
 
 
 def _annotate(span, outcome: Outcome) -> None:
