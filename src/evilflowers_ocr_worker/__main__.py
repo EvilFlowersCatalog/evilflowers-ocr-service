@@ -62,12 +62,16 @@ def selftest(languages: list[str]) -> int:
                     acquisition_id=run_id,
                     source="scan.pdf",
                     destination=f"out/{name}-{language}.pdf",
+                    # Required by the contract (issue #5); processing never writes the outcome file.
+                    outcome=f"out/{name}-{language}.json",
+                    token="selftest",
                     language=language,
                     engine=name,
                 )
                 outcome = processing.run(request, settings, run_id)
                 failures += outcome.status != "done"
-                print(json.dumps({"engine": name, "language": language, **outcome.result()}))
+                details = outcome.file(run_id, request.token).model_dump(exclude={"run_id", "token"})
+                print(json.dumps({"engine": name, "language": language, **details}))
     return 1 if failures else 0
 
 
