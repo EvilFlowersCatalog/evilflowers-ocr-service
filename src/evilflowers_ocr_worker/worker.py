@@ -1,10 +1,17 @@
 """The Celery application: ``celery -A evilflowers_ocr_worker.worker worker -E --queues=evilflowers_ocr_worker``.
 
-=========================  ===========================  ==========================================
-Task                       Queue                        Sent by
-=========================  ===========================  ==========================================
-evilflowers_ocr_worker.ocr ``OCR_QUEUE``                the catalog, job kind ``files.ocr`` (kwargs)
-=========================  ===========================  ==========================================
+=======================================  ===========================  ==========================================
+Task                                     Queue                        Sent by
+=======================================  ===========================  ==========================================
+evilflowers_ocr_worker.ocr               ``OCR_QUEUE``                the catalog, job kind ``files.ocr`` (kwargs)
+evilflowers_ocr_worker.standalone.hocr   ``OCR_QUEUE``                the books digitalizer (issue #7)
+=======================================  ===========================  ==========================================
+
+One image, two kinds of Deployment, each consuming its ``OCR_QUEUE``: the catalog's
+(Redis db 7, ``evilflowers_ocr_worker``) and the digitalizer's (``BROKER`` on db 8,
+``OCR_QUEUE=evilflowers_ocr_worker.standalone`` scaled by KEDA, and a second one with
+``….standalone.interactive``, one replica). Producers name the queue in ``send_task``, so
+the route below only matters for a send without one.
 
 Built by the shared runtime, evilflowers-worker (issue #6): its ``create_app`` sets the
 Celery configuration every worker on the db shares (prefetch 1, the 12 h visibility
@@ -37,6 +44,8 @@ ATTRIBUTES = {
     "acquisition_id": "evilflowers.acquisition.id",
     "engine": "ocr.engine",
     "language": "ocr.language",
+    # The digitalizer's job within its run (standalone tasks).
+    "job": "evilflowers.standalone.job",
 }
 
 settings = get_settings()

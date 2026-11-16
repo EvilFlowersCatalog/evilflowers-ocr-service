@@ -8,11 +8,16 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     # The shared worker runtime (issue #6): Celery config, shutdown, delivery cap, outcome files, telemetry.
     # Pinned to a commit in [tool.uv.sources].
-    "evilflowers-worker",
+    # `judges`: the decider HTTP client of the suspicious-line check (issue #8, evilflowers-worker#6).
+    "evilflowers-worker[judges]",
     "celery[redis]>=5.6,<6",
     # 17.14 is the first release with the built-in RapidOCR engine and `ocr_engine=` selection.
     "ocrmypdf>=17.14,<18",
     "pikepdf>=10",
+    # hOCR parsing (standalone hOCR task, issue #7); already in the tree through ocrmypdf.
+    "lxml>=5",
+    # Leaf images: masks and line crops (already in the tree through ocrmypdf).
+    "pillow>=10",
     "pydantic>=2.12,<3",
     "pydantic-settings>=2.6,<3",
     "python-dotenv>=1.0",
@@ -39,8 +44,9 @@ dev = [
 ]
 
 [tool.uv.sources]
-# evilflowers-worker#3 (catalog jobs: outcome files, RuntimeSettings, run_task). Bump `rev` and `uv lock` to update.
-evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", rev = "c37d860513662adcb85794adabea39af456ffee8" }
+# evilflowers-worker#3 (catalog jobs: outcome files, RuntimeSettings, run_task), #5 (StandaloneJob), #6 (judges).
+# Bump `rev` and `uv lock` to update.
+evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", rev = "9fa590f46f971335154f340a6de23a94cbb28472" }
 
 [build-system]
 requires = ["hatchling>=1.27"]
@@ -62,6 +68,11 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "LOG", "G"]
+
+[tool.ruff.lint.per-file-ignores]
+# The line check matches exactly these look-alikes (’ ´ – ×): they are the OCR errors it looks for.
+"src/evilflowers_ocr_worker/linecheck.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/test_linecheck.py" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["evilflowers_ocr_worker"]

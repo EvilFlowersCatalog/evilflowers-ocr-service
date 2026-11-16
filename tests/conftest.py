@@ -22,6 +22,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 # First, so the kit's identity is `ocr` before any instrument or span name is resolved (they are cached).
 from evilflowers_ocr_worker import worker  # noqa: F401
+from evilflowers_ocr_worker.engines import TesseractEngine
 from evilflowers_ocr_worker.settings import Settings
 
 # One SDK provider per process (OpenTelemetry refuses to replace it), recording in memory.
@@ -41,6 +42,10 @@ LINES = [
 
 HAS_TESSERACT = shutil.which("tesseract") is not None
 needs_tesseract = pytest.mark.skipif(not HAS_TESSERACT, reason="tesseract is not installed")
+#: The standalone hOCR tests read Slovak (CI installs tesseract-ocr-slk; the image has it).
+needs_slovak = pytest.mark.skipif(
+    not HAS_TESSERACT or "slk" not in TesseractEngine().languages(), reason="tesseract has no slk pack"
+)
 
 
 @pytest.fixture
@@ -73,6 +78,44 @@ def scanned_page(lines: list[str] = LINES) -> Image.Image:
         draw.text((150, y), line, font=font, fill=0)
         y += 80
     return page
+
+
+#: Slovak with every caron and acute the engines get wrong (ť ľ ď č ž š ň, á é í ó ú ý ô ä ĺ ŕ).
+SLOVAK_LINES = [
+    "Ťažký ľadový čaj stál na stole.",
+    "Ďalšie úlohy riešila Žofia v piatok.",
+    "Kôň skákal ponad dlhý múr.",
+    "Fakulta informatiky v Bratislave",
+]
+
+#: TrueType fonts with Latin Extended-A (ť, ľ, ď): the Debian image's, then macOS's.
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+]
+
+
+def slovak_font(size: int = 48):
+    for candidate in FONT_CANDIDATES:
+        if Path(candidate).is_file():
+            return ImageFont.truetype(candidate, size=size)
+    pytest.skip("no TrueType font with Slovak diacritics on this machine")
+
+
+def slovak_leaf(path: Path, lines: list[str] = SLOVAK_LINES, dpi: int = 300) -> Path:
+    """A cleaned leaf as the digitalizer hands it over: an A5 page image at ``dpi``, black text on white."""
+    page = Image.new("L", (1748, 2480), 255)
+    draw = ImageDraw.Draw(page)
+    font = slovak_font()
+    y = 300
+    for line in lines:
+        draw.text((180, y), line, font=font, fill=0)
+        y += 110
+    path.parent.mkdir(parents=True, exist_ok=True)
+    page.save(path, dpi=(dpi, dpi))
+    return path
 
 
 def write_scanned(path: Path, pages: int = 1) -> Path:

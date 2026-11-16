@@ -14,7 +14,12 @@ rapidocr   PaddleOCR PP-OCRv6/v5 on ONNX Runtime, CPU only             ~50 Latin
 =========  ==========================================================  ==========================
 
 A new engine is one more ``Engine`` subclass in ``ENGINES``: an ocrmypdf plugin
-(built in, or passed through ``plugins()``) and a language map.
+(built in, or passed through ``plugins()``), a language map, and ``recognize``.
+
+``recognize`` OCRs one image straight to hOCR, outside the PDF pipeline: the books
+digitalizer's leaves are images (``standalone``, issue #7), and the line check reads
+a line crop with the other engine (``linecheck``, issue #8). The language map and its
+rule hold there too: a language an engine does not read is an error, never English.
 """
 
 from __future__ import annotations
@@ -26,6 +31,8 @@ from abc import ABC, abstractmethod
 from functools import cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 from evilflowers_ocr_worker.settings import Settings
@@ -65,6 +72,10 @@ class EngineError(Exception):
     """The engine cannot run this request (unknown, disabled, unavailable, or the language is not read)."""
 
 
+class EngineTimeout(EngineError):
+    """The engine ran past its time on one image."""
+
+
 def normalise_language(language: str) -> str:
     code = language.strip().lower()
     return ALPHA3_ALIASES.get(code, code)
@@ -95,9 +106,33 @@ class Engine(ABC):
             raise EngineError(f"OCR engine {self.name!r} cannot read language {alpha3!r} (no {code!r} model)")
         return code
 
+    def languages_for(self, spec: str) -> list[str]:
+        """The engine's codes for a ``+``-joined spec (``slk+eng``). Every part must be read; none is dropped."""
+        parts = [part for part in spec.split("+") if part.strip()]
+        if not parts:
+            raise EngineError(f"no language in {spec!r}")
+        return list(dict.fromkeys(self.language(part) for part in parts))
+
     def options(self, settings: Settings) -> dict[str, Any]:
         """Extra ocrmypdf options for this engine."""
         return {}
+
+    @abstractmethod
+    def recognize(
+        self,
+        image: Path,
+        languages: list[str],
+        dpi: int,
+        settings: Settings,
+        *,
+        timeout: float | None = None,
+        line: bool = False,
+    ) -> str:
+        """OCR one image (no PDF, no ocrmypdf pipeline) into an hOCR document with one ``ocr_page``.
+
+        ``line``: the image is one text line (the second reading of issue #8). ``timeout``: seconds, where the engine
+        runs out of process; past it ``EngineTimeout``.
+        """
 
     def describe(self) -> dict[str, Any]:
         available = self.available()
@@ -126,6 +161,24 @@ class TesseractEngine(Engine):
 
     def options(self, settings: Settings) -> dict[str, Any]:
         return {"tesseract_timeout": settings.tesseract_timeout}
+
+    def recognize(self, image, languages, dpi, settings, *, timeout=None, line=False) -> str:
+        # resolve(): Leptonica cannot follow some symlinked temp paths (macOS /var -> /private/var).
+        command = ["tesseract", str(image.resolve()), "stdout", "-l", "+".join(languages), "--dpi", str(dpi)]
+        if line:
+            command += ["--psm", "7"]
+        command.append("hocr")
+        limit = settings.tesseract_timeout if timeout is None else min(timeout, settings.tesseract_timeout)
+        try:
+            done = subprocess.run(command, capture_output=True, timeout=max(limit, 1.0), check=False)
+        except subprocess.TimeoutExpired as error:
+            raise EngineTimeout(f"tesseract took longer than {limit:.0f} s on {image.name}") from error
+        except OSError as error:
+            raise EngineError(f"tesseract could not run: {error}") from error
+        if done.returncode != 0:
+            stderr = done.stderr.decode(errors="replace").strip()[-1000:]
+            raise EngineError(f"tesseract failed on {image.name} (exit {done.returncode}): {stderr}")
+        return done.stdout.decode("utf-8", errors="replace")
 
 
 class RapidOcrEngine(Engine):
@@ -156,6 +209,27 @@ class RapidOcrEngine(Engine):
         if settings.rapidocr_model_dir is not None:
             return {"rapidocr_model_dir": settings.rapidocr_model_dir}
         return {}
+
+    def recognize(self, image, languages, dpi, settings, *, timeout=None, line=False) -> str:
+        """ocrmypdf's own RapidOCR plugin, called on the image: the same detection, recognition, word boxes and
+        layout as `files.ocr`, serialised by the plugin's hOCR writer (``x_wconf`` per word). In process, so
+        ``timeout`` does not apply; the caller checks its deadline between images. ``dpi`` is unused (hOCR is in
+        pixels)."""
+        from ocrmypdf.builtin_plugins import rapidocr_ocr as plugin
+        from ocrmypdf.exceptions import BadArgsError, MissingDependencyError
+
+        options = SimpleNamespace(
+            languages=list(languages),
+            rapidocr=SimpleNamespace(
+                max_side_len=settings.rapidocr_max_side_len, model_dir=settings.rapidocr_model_dir
+            ),
+        )
+        try:
+            plugin.rec_model_for_languages(options.languages)
+            page, _text = plugin.RapidOcrEngine.generate_ocr(image, options)
+        except (BadArgsError, MissingDependencyError) as error:
+            raise EngineError(f"rapidocr: {error}") from error
+        return plugin.ocr_tree_to_hocr(page)
 
 
 ENGINES: dict[str, Engine] = {engine.name: engine for engine in (TesseractEngine(), RapidOcrEngine())}

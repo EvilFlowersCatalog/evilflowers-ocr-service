@@ -32,7 +32,7 @@ import pytest
 from evilflowers_worker.deliveries import DeliveryCounter
 from evilflowers_worker.testing import assert_outcome
 
-from conftest import needs_tesseract, write_scanned
+from conftest import needs_slovak, needs_tesseract, slovak_leaf, write_scanned
 
 REDIS = os.environ.get("TEST_REDIS_URL")
 GRACE = 2.0
@@ -289,3 +289,40 @@ def test_an_idle_worker_exits_at_once(storage, tmp_path, queue):
 
     assert code == 0, log
     assert took < GRACE + 5, f"idle worker took {took:.1f} s"
+
+
+@needs_slovak
+def test_a_standalone_deployment_writes_hocr_and_the_outcome(storage, tmp_path, queue):
+    """The digitalizer's Deployment: the same image on a standalone queue, the task sent by name with kwargs."""
+    from celery import Celery
+
+    slovak_leaf(storage / "digitized/item/leaves/0003.png")
+    job_dir = "digitized/item/_studio/jobs/1-a1"
+    run = Run(storage, "")
+    run.outcome = f"{job_dir}/outcome.json"
+    worker = start_worker(storage, queue, tmp_path / "scratch")
+    try:
+        Celery(broker=REDIS).send_task(
+            "evilflowers_ocr_worker.standalone.hocr",
+            task_id=run.id,
+            queue=queue,
+            kwargs={
+                "run_id": run.id,
+                "job": "analyze-hocr-0003-a1",
+                "token": run.token,
+                "output_dir": job_dir,
+                "outcome": run.outcome,
+                "leaves": [{"leaf": 3, "image": "digitized/item/leaves/0003.png", "dpi": 300, "language": "slk"}],
+            },
+        )
+        body = run.wait(timeout=180)
+        wait_for(lambda: "succeeded" in worker.log_path.read_text(errors="replace"), 30, "task-succeeded")
+    finally:
+        log = stop(worker)
+
+    assert body, f"no outcome file; worker log:\n{log}"
+    assert_outcome(
+        storage, run.outcome, run_id=run.id, token=run.token, status="done", after=f"{job_dir}/0003_hocr.html"
+    )
+    assert "Ťažký" in body["leaves"][0]["text"]
+    assert run.token not in log, "the token is never logged"

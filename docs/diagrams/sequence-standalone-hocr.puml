@@ -1,0 +1,39 @@
+@startuml sequence-standalone-hocr
+!include elvira.iuml
+' What: the standalone task OCRs each leaf image to hOCR with the shared engines, checks suspicious lines, and writes the outcome file last.
+' Source: evilflowers-ocr-service#7, #8; evilflowers-books-digitalizer docs/design/target-architecture.md §2-§3, §6 (2026-11-16)
+
+title evilflowers_ocr_worker.standalone.hocr: leaf images to hOCR (proposal, 2026-11-16)
+
+participant "digitalizer" as orch
+queue "Redis db 8\n….standalone\n(.interactive)" as redis
+participant "standalone\n.hocr" as task <<focus>>
+participant "engines" as eng
+participant "linecheck" as check
+participant "decider\n(Laya)" as decider <<proposed>>
+database "STORAGE\n_PATH" as fs
+
+orch -> redis : send_task(run_id, job, token,\noutput_dir, outcome,\nleaves[], engine;\nlink, link_error)
+redis -> task : deliver (acks_late)
+loop each leaf (deadline first)
+  task -> fs : read leaf image
+  task -> task : mask painted white\non a private copy
+  task -[$accent_msg()]> eng : <b>recognize</b>\n<b>(copy, slk+eng, dpi)</b>
+  eng --> task : hOCR page
+  task -> check : lines + confidence
+  check -> eng : suspicious line crop,\nthe other engine
+  eng --> check : second reading
+  opt still disputed, JUDGES_ENABLED
+    check -> decider : which reading?\n(a | b | neither)
+    decider --> check : verdict, p, model
+  end
+  check --> task : suspicious, readings,\nchosen, p, model
+  task -> fs : NNNN_hocr.html\nNNNN_lines.json
+end
+task -> fs : outcome file LAST\n(done | failed)
+task --> redis : compact result
+redis -> orch : link: job_done\nor link_error: job_failed
+
+caption hOCR first, outcome last (the commit marker). A failure writes status failed and raises;\na SIGTERM writes nothing and the message is redelivered.
+footer ELVIRA · FIIT STU · evilflowers-ocr-service · docs/diagrams/sequence-standalone-hocr.puml
+@enduml

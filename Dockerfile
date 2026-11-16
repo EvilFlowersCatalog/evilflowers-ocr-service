@@ -37,11 +37,14 @@ RUN /app/.venv/bin/python -m ocrmypdf.builtin_plugins.rapidocr_ocr download \
 FROM python:3.12-slim
 
 # Tesseract with the language packs of issue #2 (+ osd for page rotation), and ocrmypdf's helpers.
+# Hunspell with the Slovak, Czech and English dictionaries: the lexicon of the suspicious-line check (issue #8).
 ARG TESSERACT_LANGUAGES="slk ces eng deu hun pol rus ukr fra osd"
+ARG HUNSPELL_DICTIONARIES="sk cs en-us"
 RUN set -eux; \
     packs=""; for lang in ${TESSERACT_LANGUAGES}; do packs="$packs tesseract-ocr-$lang"; done; \
+    dicts=""; for dict in ${HUNSPELL_DICTIONARIES}; do dicts="$dicts hunspell-$dict"; done; \
     apt-get update; \
-    apt-get install -y --no-install-recommends tesseract-ocr $packs ghostscript unpaper pngquant; \
+    apt-get install -y --no-install-recommends tesseract-ocr $packs ghostscript unpaper pngquant hunspell $dicts; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

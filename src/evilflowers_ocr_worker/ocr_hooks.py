@@ -24,19 +24,28 @@ Termination
     handler's exception (``SystemExit``) propagates unchanged. No outcome file is
     written, and Redis gets the message back (acks_late).
 
+Page images
+    With ``keep_images`` (``OCR_LINE_CHECK``, issue #8) the same hook saves a copy of
+    each page image it lets through, so ``processing`` can check its lines after the
+    run. ocrmypdf exposes no per-line confidence, so this is the seam.
+
 Pages run in ocrmypdf's worker THREADS (``use_threads=True``, forced by
 ``processing``); the state is process memory guarded by a lock, keyed by the run's
 output file so two runs never mix.
 """
 
 import contextlib
+import logging
 import signal
 import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from ocrmypdf import hookimpl
+
+logger = logging.getLogger(__name__)
 
 #: Signals that stop the run: the kit's cold cancel (billiard terminates the child: TERM; QUIT), Ctrl+C,
 #: billiard's soft limit.
@@ -58,16 +67,18 @@ class _Run:
     deadline: float | None
     pages: set[int] = field(default_factory=set)
     aborted: bool = False
+    #: Where to keep a copy of every page image OCR'd (`OCR_LINE_CHECK`, issue #8); None: kept nowhere.
+    keep_images: Path | None = None
 
 
 _lock = threading.Lock()
 _runs: dict[str, _Run] = {}
 
 
-def start(key: str, deadline: float | None = None) -> None:
-    """Register a run. ``deadline`` is a ``time.monotonic()`` value."""
+def start(key: str, deadline: float | None = None, keep_images: Path | None = None) -> None:
+    """Register a run. ``deadline`` is a ``time.monotonic()`` value; ``keep_images`` a directory for page images."""
     with _lock:
-        _runs[key] = _Run(deadline)
+        _runs[key] = _Run(deadline, keep_images=keep_images)
 
 
 def finish(key: str) -> set[int]:
@@ -144,5 +155,11 @@ def filter_ocr_image(page, image):
     if run is not None:
         with _lock:
             run.pages.add(page.pageno)
+        if run.keep_images is not None:
+            # Advisory copy for the line check: a full scratch disk must not fail the page's OCR.
+            try:
+                image.save(run.keep_images / f"{page.pageno:06d}.png")
+            except OSError:
+                logger.warning("Line check: could not keep the image of page %d", page.pageno + 1, exc_info=True)
     # The same object back: ocrmypdf then knows the image is unchanged and skips re-encoding it.
     return image

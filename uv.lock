@@ -264,8 +264,10 @@ source = { editable = "." }
 dependencies = [
     { name = "celery", extra = ["redis"] },
     { name = "evilflowers-worker" },
+    { name = "lxml" },
     { name = "ocrmypdf" },
     { name = "pikepdf" },
+    { name = "pillow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
@@ -291,11 +293,13 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "celery", extras = ["redis"], specifier = ">=5.6,<6" },
-    { name = "evilflowers-worker", git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?rev=c37d860513662adcb85794adabea39af456ffee8" },
-    { name = "evilflowers-worker", extras = ["otel"], marker = "extra == 'otel'", git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?rev=c37d860513662adcb85794adabea39af456ffee8" },
+    { name = "evilflowers-worker", extras = ["judges"], git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?rev=9fa590f46f971335154f340a6de23a94cbb28472" },
+    { name = "evilflowers-worker", extras = ["otel"], marker = "extra == 'otel'", git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?rev=9fa590f46f971335154f340a6de23a94cbb28472" },
+    { name = "lxml", specifier = ">=5" },
     { name = "ocrmypdf", specifier = ">=17.14,<18" },
     { name = "onnxruntime", marker = "extra == 'rapidocr'", specifier = ">=1.22" },
     { name = "pikepdf", specifier = ">=10" },
+    { name = "pillow", specifier = ">=10" },
     { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pydantic-settings", specifier = ">=2.6,<3" },
     { name = "python-dotenv", specifier = ">=1.0" },
@@ -314,7 +318,7 @@ dev = [
 [[package]]
 name = "evilflowers-worker"
 version = "0.1.0"
-source = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?rev=c37d860513662adcb85794adabea39af456ffee8#c37d860513662adcb85794adabea39af456ffee8" }
+source = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker?rev=9fa590f46f971335154f340a6de23a94cbb28472#9fa590f46f971335154f340a6de23a94cbb28472" }
 dependencies = [
     { name = "celery", extra = ["redis"] },
     { name = "opentelemetry-api" },

@@ -115,6 +115,79 @@ The task's return value becomes the job's `result` in the ledger. It is kept com
 `pages_ocred`, `engine`, `seconds`) because Celery's event carries a repr capped at 1024 characters. The
 full outcome lives in the file.
 
+## Standalone hOCR for the books digitalizer
+
+A second task, **`evilflowers_ocr_worker.standalone.hocr`**, OCRs the books digitalizer's cleaned leaves to
+hOCR with the same engines (issue #7; design: evilflowers-books-digitalizer `docs/design/target-architecture.md`
+§2–§3). It has no catalog and no PDF: each leaf image goes straight to the engine (`Engine.recognize`).
+`files.ocr` is unchanged.
+
+![Standalone hOCR](docs/diagrams/sequence-standalone-hocr.svg)
+
+| | |
+|---|---|
+| Queues | `evilflowers_ocr_worker.standalone` (bulk, up to 32 leaves, KEDA 0..N) and `evilflowers_ocr_worker.standalone.interactive` (1 leaf, one replica always on) on the digitalizer's Redis **db 8** |
+| Deployment | the same image, `BROKER=redis://…/8`, `OCR_QUEUE=<one of the queues>`, one Deployment per queue |
+| Callbacks | the orchestrator sends with `link` / `link_error`; the return value stays compact (`job`, `status`, `leaves`, `suspicious`) |
+
+```python
+standalone_hocr(
+    run_id: str, job: str,      # echoed back
+    token: str,                 # echoed back, never logged
+    output_dir: str,            # job-scoped: <item>/_studio/jobs/<job>/
+    outcome: str,               # written last
+    leaves: [{"leaf": 3, "image": "digitized/…/0003.tif", "dpi": 600,
+              "language": "slk+eng", "mask": [[10, 2210, 50, 2250]]}],
+    engine: str = None,         # "tesseract" | "rapidocr"; None → OCR_DEFAULT_ENGINE
+    line_check: bool = None,    # None → STANDALONE_LINE_CHECK
+)
+```
+
+- Every path is relative to `STORAGE_PATH`. The leaf image is only read: `mask` boxes (`[x0, y0, x1, y1]`, x1 and
+  y1 exclusive) are painted white on a private copy in scratch space.
+- `language` is a `+`-joined spec. Every part must be read by the engine; a missing one fails the job, never
+  falls back to English.
+- Per leaf, written atomically into `output_dir`: `NNNN_hocr.html` (one `ocr_page`, ids relabelled to the IA
+  convention `page_%06d`, `line_%06d_N`) and `NNNN_lines.json` (every line: id, bbox, text, confidence, verdict).
+- The outcome file, last and atomic: `{run_id, token, status, error, leaves: [{leaf, hocr, text, mean_conf,
+  lines, suspicious}], engine, engine_version, lexicon, seconds}`. `mean_conf` is 0..100 over words.
+- `failed` is written and then raised (Celery fires `link_error`); a stop (SIGTERM) writes nothing and the
+  message is redelivered; past `MAX_DELIVERIES` a `failed` outcome is written. An invalid message whose
+  `outcome` and `token` are usable gets a `failed` outcome naming the contract error.
+- The run deadline (`TASK_SOFT_TIME_LIMIT`) is checked before every leaf and bounds each Tesseract process.
+
+The message is the kit's `StandaloneJob` (evilflowers-worker#5) plus `leaves`, `engine` and `line_check`. The kit
+requires `inputs`; the digitalizer sends only `leaves`, so a message without `inputs` gets the leaves' images.
+
+### Suspicious lines (issue #8)
+
+Tesseract invents punctuation on noisy scans and RapidOCR turns carons into apostrophes (the benchmark below).
+The line check (`linecheck.py`) flags such lines and accepts a correction only when two engines agree.
+
+- **Signals, no model.** A line is suspicious when any of these fires: mean confidence under
+  `LINE_CHECK_CONFIDENCE` **and** a word outside the hunspell lexicon; broken diacritics (`t'`, `l'`, `d'` in a
+  Slovak or Czech line, at any confidence); a run of stray punctuation; a hyphenation artefact (`slo- vo`, `¬`).
+- **Second reading.** The other engine (Tesseract ↔ RapidOCR) reads the line's crop. The correction is accepted
+  only when both readings are equal after normalisation (NFC, apostrophes, `t'` → `ť`, quotes, dashes, spacing)
+  **and** at most `max(2, LINE_CHECK_MAX_EDIT_RATIO × length)` edits apart (`t'` → `ť` is one edit). `chosen` is
+  then the reading with broken diacritics repaired, but only where the second reading has the caron: an apostrophe
+  both engines read (`it's`, `d'Artagnan`) stays. Otherwise the line is `disputed` with both readings and
+  `chosen: null`.
+- **Judge (optional).** A line still disputed with two readings is put to `decider` (Laya, text only) through the
+  kit's `judges` (evilflowers-worker#6): "which reading is the correct text?" (`a`, `b`, `neither`). Its `p`,
+  `model@revision`, `verdict` and `band` are stored on the line. The dispute is settled only in the calibrated
+  `keep` band (`JUDGE_THRESHOLDS={"ocr_line_reading": {"keep": …, "hide": …}}`, knowledge#65); without thresholds
+  the line stays disputed. Off unless `JUDGES_ENABLED=true` and `DECIDER_URL` are set; one budget per job
+  (`JUDGE_BUDGET_CALLS`, `JUDGE_BUDGET_SECONDS`); a judge that does not answer changes nothing.
+- **Output.** Per suspicious line, in the outcome: `{line, bbox, suspicious, reasons, readings, chosen,
+  disputed, p, model, verdict, band}`. The hOCR itself is never rewritten: `chosen` is a proposal for the
+  digitalizer's review screen.
+- **`files.ocr`.** With `OCR_LINE_CHECK=true`, every OCR'd page is checked and the findings go to the outcome's
+  `warnings` (a `line check: N suspicious lines, M disputed` summary first). Off by default: ocrmypdf keeps no
+  per-line confidence, so each page is OCR'd a second time.
+- **Lexicon.** Hunspell `sk_SK`, `cs_CZ`, `en_US` (in the image). A language without an installed dictionary gets
+  no lexicon signal; the outcome's `lexicon` lists the dictionaries actually used.
+
 ## OCR engines
 
 Every engine is an [ocrmypdf](https://ocrmypdf.readthedocs.io) OCR engine plugin, so the engines share the
@@ -188,6 +261,13 @@ Everything comes from the environment (or `.env`, see `.env.sample`).
 | `TASK_SOFT_TIME_LIMIT` / `TASK_TIME_LIMIT` | `13200` / `14100` s | run deadline / Celery hard kill; both below the catalog's `EVILFLOWERS_OCR_TIME_LIMIT` (4 h) |
 | `BROKER_VISIBILITY_TIMEOUT` | `43200` s | above the hard limit, and **equal to the other consumers of Redis db 7**; the shortest value wins for everyone (knowledge#30) |
 | `TESSERACT_TIMEOUT` | `600` s | per page |
+| `RAPIDOCR_MAX_SIDE_LEN` | `2000` px | standalone hOCR: RapidOCR downscales a longer leaf |
+| `STANDALONE_LINE_CHECK` / `OCR_LINE_CHECK` | `true` / `false` | the suspicious-line check in the standalone task / in `files.ocr` |
+| `LINE_CHECK_CONFIDENCE` | `80` | a line under it with an unknown word is suspicious |
+| `LINE_CHECK_MAX_EDIT_RATIO` | `0.15` | largest accepted correction, relative to the line |
+| `LINE_CHECK_MAX_LINES` | `40` | second readings per page, at most |
+| `HUNSPELL_DICTIONARIES` | `{"slk":"sk_SK","ces":"cs_CZ","eng":"en_US"}` | lexicon per language |
+| `JUDGES_ENABLED` (or `DECIDER_ENABLED`), `DECIDER_URL`, `DECIDER_REVISION`, `JUDGE_THRESHOLDS`, `JUDGE_BUDGET_*` | off | the kit's `JudgeSettings`: the line check's `decider` (Deploy-Decision-Models) |
 | `WORKER_SOFT_SHUTDOWN_TIMEOUT` / `WORKER_CANCEL_TIMEOUT` | `10` / `10` s | scale-in grace / cold cancel; together under the pod's `terminationGracePeriodSeconds` (30 s) |
 | `MAX_DELIVERIES` | `5` | deliveries of one message before the book is given up `failed` (`0`: no cap) |
 | `LOG_LEVEL`, `LOG_FORMAT` | `INFO`, `json` | |
@@ -240,6 +320,10 @@ The Ansible role `evilflowers_k8s` in EvilFlowersCatalog/knowledge manages it:
 - the pod runs as uid 65534;
 - the command is
   `celery -A evilflowers_ocr_worker.worker worker -E --queues=evilflowers_ocr_worker --concurrency=1 --hostname=ocr@dev.%h`.
+
+The standalone Deployments for the books digitalizer (namespace `digitalizer`, Redis db 8) are not deployed
+yet: they belong to the knowledge repository's §4 wiring. They run the same image with
+`--queues=evilflowers_ocr_worker.standalone` (or `….standalone.interactive`) and the matching `OCR_QUEUE`.
 
 CI (`.github/workflows/image.yml`) works like this:
 

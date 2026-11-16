@@ -34,8 +34,9 @@ import ocrmypdf
 import pikepdf
 from evilflowers_worker.outcome import PARTIAL_SUFFIX
 from ocrmypdf import exceptions as ocr_errors
+from PIL import Image
 
-from evilflowers_ocr_worker import ocr_hooks
+from evilflowers_ocr_worker import linecheck, ocr_hooks, standalone
 from evilflowers_ocr_worker.contract import OcrOutcome, OcrRequest
 from evilflowers_ocr_worker.engines import Engine, EngineError, get_engine
 from evilflowers_ocr_worker.settings import Settings
@@ -159,7 +160,10 @@ def _run(request: OcrRequest, settings: Settings, run_id: str, deadline: float |
         collector = _WarningCollector()
         ocr_logger = logging.getLogger("ocrmypdf")
         ocr_logger.addHandler(collector)
-        ocr_hooks.start(str(output), deadline)
+        pages_dir = Path(scratch) / "pages" if settings.ocr_line_check else None
+        if pages_dir is not None:
+            pages_dir.mkdir()
+        ocr_hooks.start(str(output), deadline, keep_images=pages_dir)
         try:
             try:
                 with ocr_hooks.interruptible(str(output)):
@@ -199,6 +203,9 @@ def _run(request: OcrRequest, settings: Settings, run_id: str, deadline: float |
             return Outcome(
                 "skipped", pages=pages, pages_ocred=0, warnings=warnings, skipped_reason=_skip_reason(request), **base
             )
+        if pages_dir is not None:
+            checked = _line_check(pages_dir, engine, request.language, settings, deadline, Path(scratch))
+            warnings = [*warnings, *checked]
         _publish(output, destination, run_id)
 
     logger.info("OCR done: %d of %d pages OCR'd, written to %s", len(ocred), pages, request.destination)
@@ -226,6 +233,44 @@ def _ocrmypdf(source: Path, output: Path, engine: Engine, language: str, redo: b
     )
     if result != ocrmypdf.ExitCode.ok:
         raise ocr_errors.ExitCodeException(f"exit code {int(result)} ({result.name})")
+
+
+def _line_check(
+    pages_dir: Path, engine: Engine, language: str, settings: Settings, deadline: float | None, scratch: Path
+) -> list[str]:
+    """Suspicious lines of the OCR'd pages as warnings (``OCR_LINE_CHECK``, issue #8). Advisory: it never fails
+    the run. ocrmypdf keeps no per-line confidence, so every page is OCR'd once more, to hOCR, and checked."""
+    found: list[tuple[int, Any]] = []
+    stopped = None
+    try:
+        languages = engine.languages_for(language)
+        ask = standalone.judge(settings)
+        for image in sorted(pages_dir.glob("*.png")):
+            number = int(image.stem) + 1
+            with Image.open(image) as opened:
+                dpi = opened.info.get("dpi", (300, 300))
+            _page, check, _lexicon = standalone.read_page(
+                image,
+                leaf=number,
+                dpi=round(float(dpi[0] if isinstance(dpi, tuple) else dpi)),
+                engine=engine,
+                language=language,
+                languages=languages,
+                settings=settings,
+                line_check=True,
+                scratch=scratch,
+                deadline=deadline,
+                ask=ask,
+            )
+            found.extend((number, line) for line in check.suspicious)
+    except ocr_hooks.DeadlineExceeded:
+        stopped = "line check stopped at the time limit; later pages were not checked"
+    except Exception as error:  # Exception only: a stop (SystemExit) propagates as everywhere else.
+        logger.warning("Line check failed", exc_info=True)
+        stopped = f"line check failed: {type(error).__name__}: {error}"
+    disputed = sum(line.disputed for _number, line in found)
+    head = f"line check: {len(found)} suspicious lines, {disputed} disputed"
+    return [head, *linecheck.summary(found)[:MAX_WARNINGS], *([stopped] if stopped else [])]
 
 
 def _skip_reason(request: OcrRequest) -> str:

@@ -50,11 +50,13 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      # The real-OCR tests need Tesseract (English is enough for the fixtures).
+      # The real-OCR tests need Tesseract: English for the files.ocr fixtures, Slovak for the standalone hOCR ones
+      # (issue #7), rendered with DejaVu (ť ľ ď). Hunspell sk for the line check's lexicon (issue #8).
       - name: System packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-osd ghostscript
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-slk \
+            tesseract-ocr-osd ghostscript fonts-dejavu-core hunspell hunspell-sk
       - name: Install
         run: uv sync --locked --all-extras
       - name: Lint
