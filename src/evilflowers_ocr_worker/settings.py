@@ -11,12 +11,15 @@ The variable names are the ones issue #1 fixes (``BROKER``, ``OCR_QUEUE``,
 are accepted too, as in the sibling workers.
 """
 
+import json
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated, Any
 
 from evilflowers_worker.judges import JudgeSettings
 from evilflowers_worker.settings import RuntimeSettings
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
+from pydantic_settings import NoDecode
 
 #: The pod's terminationGracePeriodSeconds (knowledge#54). The shutdown grace and the cancel must fit inside it.
 POD_TERMINATION_GRACE = 30
@@ -24,6 +27,9 @@ POD_TERMINATION_GRACE = 30
 #: The books digitalizer's queues (issue #7): bulk (KEDA 0..N) and interactive (one replica, always on).
 STANDALONE_QUEUE = "evilflowers_ocr_worker.standalone"
 STANDALONE_INTERACTIVE_QUEUE = "evilflowers_ocr_worker.standalone.interactive"
+
+#: The line check's lexicon (issue #8): the dictionaries the image installs.
+DEFAULT_HUNSPELL_DICTIONARIES = {"slk": "sk_SK", "ces": "cs_CZ", "eng": "en_US"}
 
 
 class Settings(RuntimeSettings, JudgeSettings):
@@ -94,9 +100,18 @@ class Settings(RuntimeSettings, JudgeSettings):
     #: Second readings per page, at most: a garbage page must not cost hundreds of crops.
     line_check_max_lines: int = Field(40, ge=0)
     #: Hunspell dictionary per language code; languages without one (or not installed) get no lexicon signal.
-    hunspell_dictionaries: dict[str, str] = Field(
-        default_factory=lambda: {"slk": "sk_SK", "ces": "cs_CZ", "eng": "en_US"}
+    #: ``NoDecode`` + the validator below: a blank ``HUNSPELL_DICTIONARIES=`` means the default instead of stopping
+    #: the worker at startup (the env source would JSON-decode it first; evilflowers-worker#8).
+    hunspell_dictionaries: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=lambda: dict(DEFAULT_HUNSPELL_DICTIONARIES)
     )
+
+    @field_validator("hunspell_dictionaries", mode="before")
+    @classmethod
+    def _dictionaries_json(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return json.loads(value) if value.strip() else dict(DEFAULT_HUNSPELL_DICTIONARIES)
+        return value
 
     # -- Logs ---------------------------------------------------------------------------------------------------
     #: Level of the root logger. The deployment's command has no `--loglevel`, and Celery's default

@@ -44,9 +44,9 @@ dev = [
 ]
 
 [tool.uv.sources]
-# evilflowers-worker#3 (catalog jobs: outcome files, RuntimeSettings, run_task), #5 (StandaloneJob), #6 (judges).
-# Bump `rev` and `uv lock` to update.
-evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", rev = "9fa590f46f971335154f340a6de23a94cbb28472" }
+# evilflowers-worker#3 (catalog jobs: outcome files, RuntimeSettings, run_task), #5 (StandaloneJob), #6 (judges),
+# #8 (an empty JUDGE_THRESHOLDS= no longer stops the worker). Bump `rev` and `uv lock` to update.
+evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", rev = "e530f68d2e3d98519008d39b30fee96f28009834" }
 
 [build-system]
 requires = ["hatchling>=1.27"]

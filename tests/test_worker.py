@@ -62,6 +62,28 @@ def test_environment_names(monkeypatch):
     assert settings.max_deliveries == 3
 
 
+def test_blank_dict_variables_do_not_stop_the_worker(monkeypatch):
+    """A rollback leaves `JUDGE_THRESHOLDS=` (and maybe `HUNSPELL_DICTIONARIES=`) set but empty
+    (evilflowers-worker#8): the defaults apply, and the worker still starts."""
+    monkeypatch.setenv("JUDGE_THRESHOLDS", "")
+    monkeypatch.setenv("HUNSPELL_DICTIONARIES", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.judge_thresholds == {}
+    assert settings.hunspell_dictionaries == {"slk": "sk_SK", "ces": "cs_CZ", "eng": "en_US"}
+
+
+def test_dict_variables_still_parse_json(monkeypatch):
+    monkeypatch.setenv("JUDGE_THRESHOLDS", '{"ocr_line_reading": {"keep": 0.9, "hide": 0.95}}')
+    monkeypatch.setenv("HUNSPELL_DICTIONARIES", '{"slk": "sk_SK"}')
+
+    settings = Settings(_env_file=None)
+
+    assert settings.judge_thresholds["ocr_line_reading"].keep == 0.9
+    assert settings.hunspell_dictionaries == {"slk": "sk_SK"}
+
+
 def test_redis_url_and_queue_are_accepted_too(monkeypatch):
     monkeypatch.delenv("BROKER", raising=False)
     monkeypatch.delenv("OCR_QUEUE", raising=False)
