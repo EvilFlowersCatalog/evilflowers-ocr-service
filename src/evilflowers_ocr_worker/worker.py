@@ -1,4 +1,9 @@
-"""The Celery application: ``celery -A evilflowers_ocr_worker.worker worker -E --queues=evilflowers_ocr_worker``.
+"""The Celery application.
+
+``celery -A evilflowers_ocr_worker.worker worker -E --queues=evilflowers.ocr,evilflowers_ocr_worker``
+
+The image consumes ``evilflowers.ocr`` (the queue scheme of knowledge#14) next to the old ``evilflowers_ocr_worker``
+while the catalog moves the ``files.ocr`` routing (issue #11); ``OCR_QUEUE`` still defaults to the old name.
 
 =======================================  ===========================  ==========================================
 Task                                     Queue                        Sent by

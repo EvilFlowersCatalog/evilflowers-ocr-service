@@ -1,0 +1,41 @@
+# Nightly: put dev on the newest evilflowers-worker. Writes no commit and never builds master (production).
+# Rule 3 of EvilFlowersCatalog/evilflowers-worker#13 (this repo: issue #12). Diagram:
+# docs/diagrams/sequence-kit-nightly.puml
+#
+# The shared worker-nightly.yml of evilflowers-actions:
+#   1. evilflowers-worker `master` → its head commit (git ls-remote)
+#   2. the kit commit inside ghcr.io/evilflowerscatalog/evilflowers-ocr-service:develop (image label
+#      sk.stuba.elvira.evilflowers-worker.revision, set by image.yml)
+#   3. different (or no label, or force) → dispatch image.yml on develop with reason=nightly; that run resolves master
+#      again, tests, builds, pushes :develop and redeploys dev, and opens an issue when it fails
+#      same → nothing: a rebuild of the same code is a new digest, and its rollout would requeue a book for nothing
+#
+# A hold (repository variable KIT_REF) makes it do nothing unless `force` is set.
+#
+# evilflowers-actions is referenced at @master: it has no release tag yet. Move to @v1 together with image.yml.
+#
+# `schedule` runs only from the default branch: the cron fires once this file is on `master`.
+
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"           # 02:17 UTC, off the top of the hour
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and redeploy develop even if :develop already has master's evilflowers-worker
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  nightly:
+    uses: EvilFlowersCatalog/evilflowers-actions/.github/workflows/worker-nightly.yml@master
+    permissions:
+      actions: write               # dispatch image.yml
+      packages: read               # read the :develop image's labels
+    with:
+      workflow: image.yml
+      force: ${{ inputs.force || false }}
