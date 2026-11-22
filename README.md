@@ -27,7 +27,7 @@ catalog ──(Redis db 7, queue evilflowers_ocr_worker)──▶ ocr worker ─
 | | |
 |---|---|
 | Task | `evilflowers_ocr_worker.ocr` (the old name, so existing routes keep working) |
-| Queue | `evilflowers_ocr_worker` (catalog `EVILFLOWERS_OCR_QUEUE`) |
+| Queue | `evilflowers.ocr` (scheme `evilflowers.<service>`, knowledge#14) and the old `evilflowers_ocr_worker`: the image consumes both while the catalog moves the routing (EvilFlowersCatalog#222, catalog `EVILFLOWERS_OCR_QUEUE`) |
 | Task id | the catalog's **run id**; a retry is a new run with a new id |
 | Events | the worker runs with `-E`; the catalog builds the job status from task events |
 
@@ -306,7 +306,7 @@ Queries: Tempo `{resource.service.name="ocr"}`; Loki `{service_name="ocr"} | jso
 ```bash
 uv sync --all-extras                 # Python 3.12; system Tesseract + Ghostscript for the OCR tests
                                      # evilflowers-worker: the commit uv.lock last resolved from its master;
-uv lock --upgrade-package evilflowers-worker   # catch up with the worker's master (CI does this on every run)
+uv lock --upgrade-package evilflowers-worker   # catch up with the worker's master (CI locks it per run)
 uv run pytest -q                     # unit tests and real OCR on generated PDFs
 docker run -d --rm -p 6390:6379 redis:7
 env TEST_REDIS_URL=redis://localhost:6390/15 uv run pytest -q tests/test_worker_e2e.py   # real prefork worker
@@ -324,31 +324,45 @@ The Ansible role `evilflowers_k8s` in EvilFlowersCatalog/knowledge manages it:
 - `/tmp` is an emptyDir, and the root filesystem is read-only;
 - the pod runs as uid 65534;
 - the command is
-  `celery -A evilflowers_ocr_worker.worker worker -E --queues=evilflowers_ocr_worker --concurrency=1 --hostname=ocr@dev.%h`.
+  `celery -A evilflowers_ocr_worker.worker worker -E --queues=evilflowers.ocr,evilflowers_ocr_worker --concurrency=1 --hostname=ocr@dev.%h`;
+- the image is `:develop`, with `imagePullPolicy: Always`.
 
 The standalone Deployments for the books digitalizer (namespace `digitalizer`, Redis db 8) are not deployed
 yet: they belong to the knowledge repository's §4 wiring. They run the same image with
 `--queues=evilflowers_ocr_worker.standalone` (or `….standalone.interactive`) and the matching `OCR_QUEUE`.
 
-CI (`.github/workflows/image.yml`) works like this:
+CI follows the kit rule set EvilFlowersCatalog/evilflowers-worker#13 (issue #12) with the shared pieces of
+[evilflowers-actions](https://github.com/EvilFlowersCatalog/evilflowers-actions), referenced at `@master` until it
+has a release tag. Which evilflowers-worker a build gets:
 
-1. **Resolve:** `uv lock --upgrade-package evilflowers-worker` picks the worker's current `master`
-   (pyproject tracks the branch, not a commit). The resulting uv.lock goes to the next jobs, and nothing is
+| This repository's ref | Kit ref the build locks |
+|---|---|
+| `develop`, PRs, other branches | the kit's `master` head |
+| `master` (production), tags `v*.*.*` | the kit's newest release tag `vX.Y.Z`; no tag, no build |
+| repository variable `KIT_REF` set | that ref: a hold on a known-good tag (it also pauses the nightly) |
+
+Cut a kit tag before you merge `develop` → `master`, or the `master` build locks an older kit than `develop` tested.
+
+`.github/workflows/image.yml` works like this:
+
+1. **Resolve:** `resolve-worker` locks the kit for this run only. On `master` and tags it rewrites the source in
+   pyproject.toml to `tag = "vX.Y.Z"`. pyproject.toml and uv.lock go to the next jobs as an artifact, and nothing is
    committed back.
 2. **Check:** lint, then tests against a real Redis, on that lock.
 3. **Build:** builds the image and smoke-tests it read-only and offline. It also checks that the installed worker
    is the resolved commit.
-4. **Push:** pushes `ghcr.io/evilflowerscatalog/evilflowers-ocr-service:{master,sha-<short>}`.
-5. **Deploy** (default branch only): runs `rollout restart` on `elvira-k3s`, checks the digest, and reports the
-   deploy to LGTM, succeeded or failed:
+4. **Push:** pushes `ghcr.io/evilflowerscatalog/evilflowers-ocr-service` as `:develop` / `:master`, `:X.Y.Z` for a
+   tag, and `:sha-<short>`. The labels `sk.stuba.elvira.evilflowers-worker.revision` and `.ref` name the kit.
+5. **Deploy** (`develop` only; production is not on k3s): runs `rollout restart` on `elvira-k3s`, checks the digest,
+   and reports the deploy to LGTM, succeeded or failed, with evilflowers-actions' `scripts/otlp-deploy.sh`:
    - a Loki event: `{service_name="github-actions"} | event_name="deployment" | k8s_deployment_name="ocr"`;
    - a Tempo span: `{resource.service.name="github-actions" && name="deploy"}`;
-   - both carry the commit, the run, the digest and `evilflowers.worker.revision`;
-   - the format is the knowledge proposal CI-Deploy-Unification;
+   - both carry the commit, the run, the digest, `evilflowers.deploy.trigger` (`push` | `nightly` | `manual`),
+     `evilflowers.worker.revision` and `evilflowers.worker.ref`;
    - the event is skipped with a warning until the runner pods have `ELVIRA_OTLP_HTTP_ENDPOINT`.
 
-**Nightly** (02:17 UTC) the same pipeline runs on `master`, so a new evilflowers-worker reaches dev within a day,
-without a commit here:
-- it builds and deploys only when `:master` does not already carry this commit and the worker's current `master`
-  (the image labels say which);
-- it pushes `:master` only, and `:sha-<short>` keeps naming the image of the push.
+**Nightly** (`.github/workflows/nightly.yml`, 02:17 UTC, shared `worker-nightly.yml`): it compares the kit's
+`master` head with the label of `:develop`. Only when they differ does it dispatch `image.yml` on `develop` with
+`reason=nightly`, so a new evilflowers-worker reaches dev within a day, without a commit here. No schedule ever
+builds `master`. A failing nightly opens one issue per streak, `nightly: evilflowers-worker <sha> breaks
+evilflowers-ocr-service`. `workflow_dispatch` with `force` rebuilds even when nothing moved.

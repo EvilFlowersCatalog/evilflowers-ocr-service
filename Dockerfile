@@ -3,7 +3,7 @@
 # -- build: the virtual environment from uv.lock, and the RapidOCR models -------------------------------------------
 FROM python:3.12-slim AS build
 
-# git: uv fetches evilflowers-worker at the commit uv.lock records (CI re-resolves its `master` before every build).
+# git: uv fetches evilflowers-worker at the commit uv.lock records (CI locks it per build: resolve-worker).
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /bin/uv
@@ -52,8 +52,8 @@ COPY --from=build /app/.venv /app/.venv
 COPY --from=build /app/models /app/models
 
 # IMAGE_TAG becomes service.version on every span, metric and log (the kit's RuntimeSettings): CI passes
-# <ref>@<sha>+worker.<short>, so telemetry says which evilflowers-worker commit ran. The full commit is a label too:
-# the nightly run compares it with what :master already carries and skips the build when nothing moved.
+# <ref>@<sha>+worker.<short>, so telemetry says which evilflowers-worker commit ran. The full commit is a label too
+# (CI adds `.ref`): nightly.yml compares the one :develop carries with the kit's master and rebuilds only when it moved.
 ARG IMAGE_TAG=dev
 ARG EVILFLOWERS_WORKER_REVISION=unknown
 LABEL sk.stuba.elvira.evilflowers-worker.revision=${EVILFLOWERS_WORKER_REVISION}
@@ -73,5 +73,8 @@ USER 65534:65534
 # Prefork with one child: Flower can inspect the worker while a book is OCR'd, and telemetry starts in the
 # child (worker_process_init). Pages run in parallel inside it (OCR_JOBS threads). The k8s Deployment adds
 # --hostname=ocr@<env>.%h.
+# Queues (issue #11, scheme `evilflowers.<service>` of knowledge#14): `evilflowers.ocr` next to the old
+# `evilflowers_ocr_worker` while the catalog moves the files.ocr routing (EvilFlowersCatalog#222). Drop the old one once
+# its list stays empty.
 CMD ["celery", "-A", "evilflowers_ocr_worker.worker", "worker", "--loglevel=INFO", "-E", "--concurrency=1", \
-     "--queues=evilflowers_ocr_worker"]
+     "--queues=evilflowers.ocr,evilflowers_ocr_worker"]

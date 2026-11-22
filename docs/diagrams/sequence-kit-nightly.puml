@@ -1,0 +1,34 @@
+@startuml sequence-kit-nightly
+!include elvira.iuml
+' What: the nightly compares evilflowers-worker master with the kit label of :develop and dispatches image.yml on develop; image.yml locks the kit per branch rule, tests, ships, redeploys dev and reports the deploy to LGTM.
+' Source: .github/workflows/nightly.yml, .github/workflows/image.yml; evilflowers-actions@master worker-nightly.yml, resolve-worker, report-nightly-failure; evilflowers-worker#13 (2026-11-22)
+
+title ocr: evilflowers-worker nightly on develop, release tags for master (2026-11-22)
+
+participant "nightly.yml\n02:17 UTC" as nightly <<focus>>
+participant "evilflowers-worker\nmaster / v*.*.*" as kit
+database "GHCR\n:develop" as ghcr
+participant "image.yml\non develop" as image
+participant "deploy\n(elvira-k3s runner)" as deploy
+participant "k3s API\nevilflowers-dev/ocr" as k8s
+participant "alloy-node\n:4318" as alloy
+
+nightly -> kit : git ls-remote refs/heads/master
+kit --> nightly : head H
+nightly -> ghcr : skopeo inspect :develop\nlabel worker.revision R
+alt H = R, or KIT_REF hold
+  nightly -> nightly : nothing to build
+else H != R, or force
+  nightly -[$accent_msg()]> image : <b>workflow_dispatch</b>\n<b>ref develop, reason=nightly</b>
+  image -> kit : resolve-worker: uv lock\n(develop: master)
+  kit --> image : commit H
+  image -> image : lint + pytest, docker build,\nselftest, installed worker == H
+  image -> ghcr : push :develop :sha-<short>\nlabels worker.revision H, worker.ref master
+  image -> deploy : digest
+  deploy -> k8s : rollout restart, status,\npods run the digest?
+  deploy -> alloy : OTLP/HTTP JSON: event.name=deployment\n+ span deploy, trigger=nightly
+  opt a job failed
+    image -> image : report-nightly-failure:\none issue per streak
+  end
+end
+@enduml

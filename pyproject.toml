@@ -7,7 +7,7 @@ authors = [{ name = "Jakub Dubec", email = "jakub.dubec@stuba.sk" }]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     # The shared worker runtime (issue #6): Celery config, shutdown, delivery cap, outcome files, telemetry.
-    # Pinned to a commit in [tool.uv.sources].
+    # Its master branch in [tool.uv.sources]; CI locks the commit.
     # `judges`: the decider HTTP client of the suspicious-line check (issue #8, evilflowers-worker#6).
     "evilflowers-worker[judges]",
     "celery[redis]>=5.6,<6",
@@ -44,9 +44,10 @@ dev = [
 ]
 
 [tool.uv.sources]
-# Tracks the worker's `master`: CI (every push and the nightly run of .github/workflows/image.yml) re-resolves it
-# with `uv lock --upgrade-package evilflowers-worker` before testing and building, so every image carries the latest
-# kit. The commit in uv.lock is only the last one resolved locally; run the same command to catch up.
+# Stays on branch = "master" (evilflowers-worker#13, issue #12; keep it on one line, resolve-worker rewrites it). CI
+# locks the kit per run with evilflowers-actions `resolve-worker`: develop and PRs on its master head, master and tags
+# on its newest release tag vX.Y.Z, the repository variable KIT_REF as a hold. The commit in uv.lock is only the local
+# baseline; `uv lock --upgrade-package evilflowers-worker` catches up with master.
 evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", branch = "master" }
 
 [build-system]
