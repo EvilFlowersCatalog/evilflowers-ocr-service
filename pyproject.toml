@@ -44,9 +44,10 @@ dev = [
 ]
 
 [tool.uv.sources]
-# evilflowers-worker#3 (catalog jobs: outcome files, RuntimeSettings, run_task), #5 (StandaloneJob), #6 (judges),
-# #8 (an empty JUDGE_THRESHOLDS= no longer stops the worker). Bump `rev` and `uv lock` to update.
-evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", rev = "e530f68d2e3d98519008d39b30fee96f28009834" }
+# Tracks the worker's `master`: CI (every push and the nightly run of .github/workflows/image.yml) re-resolves it
+# with `uv lock --upgrade-package evilflowers-worker` before testing and building, so every image carries the latest
+# kit. The commit in uv.lock is only the last one resolved locally; run the same command to catch up.
+evilflowers-worker = { git = "https://github.com/EvilFlowersCatalog/evilflowers-worker", branch = "master" }
 
 [build-system]
 requires = ["hatchling>=1.27"]

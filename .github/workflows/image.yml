@@ -1,19 +1,26 @@
-# OCR service image: test, build, push to GHCR (private), deploy to the dev environment.
-# Contract: knowledge note Deploy-a-Service §1 and §4; jobs copied from knowledge `intranet-image.yml`.
+# OCR service image: resolve the latest evilflowers-worker, test, build, push to GHCR (private), deploy to dev.
+# Contract: knowledge note Deploy-a-Service §1 and §4; jobs copied from knowledge `intranet-image.yml`; the deploy
+# event follows the proposal CI-Deploy-Unification ("Deployments in LGTM").
 #
-#   push to the default branch → check, build, smoke test, push :master :sha-<short>, deploy to evilflowers-dev
-#   push to another branch     → check, build, smoke test, push :sha-<short>
-#   pull request               → check, build, smoke test (no push)
-#   manual                     → as a push of the chosen ref
+#   push to the default branch → resolve, check, build, smoke test, push :master :sha-<short>, deploy to evilflowers-dev
+#   nightly (schedule)         → the same on the default branch, without :sha-<short>; skipped when :master already
+#                                carries this commit AND the worker's current master (nothing moved)
+#   push to another branch     → resolve, check, build, smoke test, push :sha-<short>
+#   pull request               → resolve, check, build, smoke test (no push)
+#   manual                     → as a push of the chosen ref (always builds)
 #
-# Deploy: the dev Deployment `ocr` runs :master with imagePullPolicy Always, so a new image goes live
-# with a rollout restart. The `deploy` job runs on the self-hosted runner INSIDE k3s (runs-on:
-# elvira-k3s), whose ServiceAccount may restart Deployments only in `github_runner_deploy_namespaces`
-# (roles/github_runner). It then checks that the running pods use the digest just pushed.
+# Latest worker: pyproject.toml tracks evilflowers-worker's `master` branch. `resolve` re-locks it
+# (`uv lock --upgrade-package evilflowers-worker`) and hands that uv.lock to `check` and `image` as an artifact, so the
+# tested and the shipped kit are the same commit. Nothing is committed back: uv.lock in git is only the last local
+# resolution. The commit is baked in as the label sk.stuba.elvira.evilflowers-worker.revision and in service.version
+# (IMAGE_TAG = <ref>@<sha>+worker.<short>), so every span, metric and log says which kit ran.
 #
-# Prerequisites outside this repo (one time): this repository in the runner group `elvira-k3s`, and the
-# Deployment `ocr` in evilflowers-dev (knowledge, Ansible role evilflowers_k8s). Until then set the
-# repository variable DEPLOY_DEV=false (or leave it unset) and the deploy job is skipped.
+# Deploy: the dev Deployment `ocr` runs :master with imagePullPolicy Always, so a new image goes live with a rollout
+# restart. The `deploy` job runs on the self-hosted runner INSIDE k3s (runs-on: elvira-k3s), whose ServiceAccount may
+# restart Deployments only in `github_runner_deploy_namespaces` (roles/github_runner). It checks that the running pods
+# use the digest just pushed, then reports the deploy (succeeded or failed) to LGTM: a Loki event and a Tempo span
+# from service.name=github-actions (.github/scripts/otlp-deploy.sh, skipped with a warning while the runner pods lack
+# ELVIRA_OTLP_HTTP_ENDPOINT).
 
 name: image
 
@@ -22,18 +29,81 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"   # 02:17 UTC nightly: pick up evilflowers-worker master
 
 permissions:
   contents: read
 
 env:
   IMAGE: ghcr.io/evilflowerscatalog/evilflowers-ocr-service
+  WORKER_LABEL: sk.stuba.elvira.evilflowers-worker.revision
 
 jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read            # nightly: read the labels of the current :master
+    outputs:
+      worker_revision: ${{ steps.lock.outputs.revision }}
+      build: ${{ steps.current.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+      - id: lock
+        name: Resolve evilflowers-worker master
+        run: |
+          locked() { grep -o 'evilflowers-worker?branch=master#[0-9a-f]*' uv.lock | head -n1 | cut -d'#' -f2; }
+          before="$(locked)"
+          uv lock --upgrade-package evilflowers-worker
+          revision="$(locked)"
+          test -n "$revision" || { echo "::error::uv.lock has no evilflowers-worker?branch=master source"; exit 1; }
+          echo "revision=${revision}" >> "$GITHUB_OUTPUT"
+          echo "evilflowers-worker master is ${revision} (uv.lock in git: ${before:-none})"
+          {
+            echo "### evilflowers-worker"
+            echo
+            echo "Resolved \`master\` → [\`${revision::7}\`](https://github.com/EvilFlowersCatalog/evilflowers-worker/commit/${revision}); uv.lock in git has \`${before::7}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: uv-lock
+          path: uv.lock
+          retention-days: 7
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: github.event_name == 'schedule'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Nightly only: rebuild when this commit or the worker moved since :master was pushed. The JSON holds the
+      # labels of every platform (and is empty when :master does not exist yet → build).
+      - id: current
+        name: Does :master already run this?
+        env:
+          REVISION: ${{ steps.lock.outputs.revision }}
+        run: |
+          build=true
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            config="$(docker buildx imagetools inspect "${IMAGE}:master" --format '{{json .Image}}' || true)"
+            if echo "$config" | grep -q "\"${WORKER_LABEL}\":\"${REVISION}\"" \
+              && echo "$config" | grep -q "\"org.opencontainers.image.revision\":\"${GITHUB_SHA}\""; then
+              build=false
+              echo "::notice:::master already carries ${GITHUB_SHA::7} with evilflowers-worker ${REVISION::7}; nothing to build"
+              echo "Nightly: \`:master\` is current, no build and no deploy." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+
   check:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
     runs-on: ubuntu-24.04
     concurrency:
-      group: ocr-check-${{ github.ref }}
+      group: ocr-check-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: true
     # tests/test_worker_e2e.py: a real prefork worker against a real Redis.
     services:
@@ -46,6 +116,10 @@ jobs:
       TEST_REDIS_URL: redis://localhost:6379/15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The uv.lock `resolve` produced (worker master), so the tests run on the kit that ships.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: uv-lock
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.12"
@@ -67,7 +141,7 @@ jobs:
         run: uv run pytest -q
 
   image:
-    needs: check
+    needs: [resolve, check]
     runs-on: ubuntu-24.04
     concurrency:
       group: ocr-image-${{ github.ref }}
@@ -77,8 +151,16 @@ jobs:
       packages: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+    env:
+      WORKER_REVISION: ${{ needs.resolve.outputs.worker_revision }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: uv-lock
+      - id: version
+        name: service.version
+        run: echo "image_tag=${GITHUB_REF_NAME}@${GITHUB_SHA}+worker.${WORKER_REVISION::12}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         if: github.event_name != 'pull_request'
@@ -86,13 +168,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # :sha-<short> names the ocr commit; a nightly rebuild of the same commit with a newer worker must not move it.
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=master,enable={{is_default_branch}}
-            type=sha,prefix=sha-,format=short
+            type=sha,prefix=sha-,format=short,enable=${{ github.event_name != 'schedule' }}
       # Build once into the local daemon, prove the image works the way k8s runs it, then push.
       - name: Build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -101,15 +184,21 @@ jobs:
           load: true
           tags: ocr-service:smoke
           build-args: |
-            IMAGE_TAG=${{ github.ref_name }}@${{ github.sha }}
+            IMAGE_TAG=${{ steps.version.outputs.image_tag }}
+            EVILFLOWERS_WORKER_REVISION=${{ env.WORKER_REVISION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       # Read-only root, no network, uid 65534, /tmp as the only writable path: every model must be
-      # baked in, and both engines must OCR a page in a Latin and a Cyrillic language.
+      # baked in, and both engines must OCR a page in a Latin and a Cyrillic language. Then: the installed kit is
+      # the commit `resolve` locked and `check` tested.
       - name: Smoke test (read-only, offline, non-root)
         run: |
           docker run --rm --read-only --network none --user 65534:65534 --tmpfs /tmp \
             ocr-service:smoke python -m evilflowers_ocr_worker selftest -l slk ces eng rus
+          installed="$(docker run --rm --network none ocr-service:smoke python -c \
+            "import json, importlib.metadata as m; print(json.loads(m.distribution('evilflowers-worker').read_text('direct_url.json'))['vcs_info']['commit_id'])")"
+          echo "evilflowers-worker in the image: ${installed}"
+          test "$installed" = "$WORKER_REVISION" || { echo "::error::image has evilflowers-worker ${installed}, expected ${WORKER_REVISION}"; exit 1; }
       - id: build
         name: Push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -119,38 +208,46 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            IMAGE_TAG=${{ github.ref_name }}@${{ github.sha }}
+            IMAGE_TAG=${{ steps.version.outputs.image_tag }}
+            EVILFLOWERS_WORKER_REVISION=${{ env.WORKER_REVISION }}
           cache-from: type=gha
 
   deploy:
-    needs: image
-    if: >-
-      github.event_name != 'pull_request'
-      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-      && vars.DEPLOY_DEV == 'true'
+    needs: [resolve, image]
+    # Every push to master, the nightly run when it built, and a manual run of master. Spelled out: a scheduled run's
+    # event payload has no `repository`, so github.event.repository.default_branch would be empty there.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
     runs-on: elvira-k3s            # ARC scale set in k3s (knowledge: roles/github_runner)
     environment:
       name: development
     concurrency:
       group: deploy-ocr-evilflowers-dev
       cancel-in-progress: false
-    permissions: {}
+    permissions:
+      contents: read               # checkout of .github/scripts
     env:
       NAMESPACE: evilflowers-dev
       DEPLOYMENT: ocr
+      ENVIRONMENT: development
       DIGEST: ${{ needs.image.outputs.digest }}
+      WORKER_REVISION: ${{ needs.resolve.outputs.worker_revision }}
       KUBECTL_VERSION: v1.31.5     # = the cluster (k3s v1.31.5+k3s1)
       KUBECTL_SHA256: fbecbfd375b3686002c2e81d51c390172f5ffba3d6b47920d55342cb03f557af   # dl.k8s.io …/linux/amd64/kubectl.sha256
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
       - name: kubectl ${{ env.KUBECTL_VERSION }} (checksum-pinned)
         run: |
           curl -fsSLo "$RUNNER_TEMP/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
           echo "${KUBECTL_SHA256}  $RUNNER_TEMP/kubectl" | sha256sum -c -
           chmod +x "$RUNNER_TEMP/kubectl"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      # In-cluster credentials: the pod's ServiceAccount arc-deployer.
+      # In-cluster credentials: the pod's ServiceAccount arc-deployer. The deploy span starts here.
       - name: Restart onto the new :master
-        run: kubectl -n "$NAMESPACE" rollout restart "deployment/$DEPLOYMENT"
+        run: |
+          echo "START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+          kubectl -n "$NAMESPACE" rollout restart "deployment/$DEPLOYMENT"
       # A Celery worker has no port and no probes: `rollout status` returns once the new pod runs.
       # The old pod may be finishing a book (terminationGracePeriodSeconds), hence the long timeout.
       - name: Wait for the rollout
@@ -165,16 +262,28 @@ jobs:
             echo "::error::a running pod does not use ${DIGEST}"
             exit 1
           fi
+      # Succeeded or failed, the deploy is an event in Loki and a span in Tempo. Never fails the job.
+      - id: event
+        name: Report the deploy to LGTM
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ "${{ job.status }}" = success ]; then outcome=succeeded; else outcome=failed; fi
+          bash .github/scripts/otlp-deploy.sh "$outcome" "${START_NS:-$(date +%s%N)}"
       - name: Summary
         if: always()
         run: |
           {
-            echo "### Deploy to ${NAMESPACE}: ${{ job.status }}"
+            echo "### Deploy to ${NAMESPACE}: ${{ job.status }} (${GITHUB_EVENT_NAME})"
             echo
-            echo "Digest \`${DIGEST}\`, commit \`${GITHUB_SHA::7}\`."
+            echo "Digest \`${DIGEST}\`, commit \`${GITHUB_SHA::7}\`, evilflowers-worker \`${WORKER_REVISION::7}\`."
             echo
             echo "Grafana (VPN): http://grafana.observability.stu.k8s.internal → Explore"
-            echo "- Tempo: \`{resource.service.name=\"ocr\"}\`"
+            echo "- Deploy event: \`{service_name=\"github-actions\"} | event_name=\"deployment\" | k8s_deployment_name=\"${DEPLOYMENT}\"\`"
+            if [ -n "${{ steps.event.outputs.trace_id }}" ]; then
+              echo "- Deploy span: Tempo trace \`${{ steps.event.outputs.trace_id }}\`"
+            fi
+            echo "- Tempo: \`{resource.service.name=\"ocr\" && resource.service.version=~\".*worker.${WORKER_REVISION::12}\"}\`"
             echo "- Loki: \`{namespace=\"${NAMESPACE}\", service_name=\"ocr\"} | json\`"
             echo "- Mimir: \`ocr_pages_total\`, \`ocr_duration_seconds_bucket\`, \`ocr_job_outcome_total\`"
           } >> "$GITHUB_STEP_SUMMARY"

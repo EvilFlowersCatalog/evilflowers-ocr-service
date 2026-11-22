@@ -297,11 +297,16 @@ unless the pod does).
 
 Queries: Tempo `{resource.service.name="ocr"}`; Loki `{service_name="ocr"} | json`.
 
+`service.version` is the image's `IMAGE_TAG`, `<ref>@<commit>+worker.<worker commit, 12 chars>`, so any span or
+`target_info` series says which evilflowers-worker the pod ran. The full worker commit is also the image label
+`sk.stuba.elvira.evilflowers-worker.revision` and the variable `EVILFLOWERS_WORKER_REVISION`.
+
 ## Development
 
 ```bash
 uv sync --all-extras                 # Python 3.12; system Tesseract + Ghostscript for the OCR tests
-                                     # evilflowers-worker comes from the commit pinned in [tool.uv.sources]
+                                     # evilflowers-worker: the commit uv.lock last resolved from its master;
+uv lock --upgrade-package evilflowers-worker   # catch up with the worker's master (CI does this on every run)
 uv run pytest -q                     # unit tests and real OCR on generated PDFs
 docker run -d --rm -p 6390:6379 redis:7
 env TEST_REDIS_URL=redis://localhost:6390/15 uv run pytest -q tests/test_worker_e2e.py   # real prefork worker
@@ -327,8 +332,23 @@ yet: they belong to the knowledge repository's §4 wiring. They run the same ima
 
 CI (`.github/workflows/image.yml`) works like this:
 
-1. **Check:** lint, then tests against a real Redis.
-2. **Build:** builds the image and smoke-tests it read-only and offline.
-3. **Push:** pushes `ghcr.io/evilflowerscatalog/evilflowers-ocr-service:{master,sha-<short>}`.
-4. **Deploy:** runs `rollout restart` on `elvira-k3s`, but only once the repository variable
-   `DEPLOY_DEV=true` is set.
+1. **Resolve:** `uv lock --upgrade-package evilflowers-worker` picks the worker's current `master`
+   (pyproject tracks the branch, not a commit). The resulting uv.lock goes to the next jobs, and nothing is
+   committed back.
+2. **Check:** lint, then tests against a real Redis, on that lock.
+3. **Build:** builds the image and smoke-tests it read-only and offline. It also checks that the installed worker
+   is the resolved commit.
+4. **Push:** pushes `ghcr.io/evilflowerscatalog/evilflowers-ocr-service:{master,sha-<short>}`.
+5. **Deploy** (default branch only): runs `rollout restart` on `elvira-k3s`, checks the digest, and reports the
+   deploy to LGTM, succeeded or failed:
+   - a Loki event: `{service_name="github-actions"} | event_name="deployment" | k8s_deployment_name="ocr"`;
+   - a Tempo span: `{resource.service.name="github-actions" && name="deploy"}`;
+   - both carry the commit, the run, the digest and `evilflowers.worker.revision`;
+   - the format is the knowledge proposal CI-Deploy-Unification;
+   - the event is skipped with a warning until the runner pods have `ELVIRA_OTLP_HTTP_ENDPOINT`.
+
+**Nightly** (02:17 UTC) the same pipeline runs on `master`, so a new evilflowers-worker reaches dev within a day,
+without a commit here:
+- it builds and deploys only when `:master` does not already carry this commit and the worker's current `master`
+  (the image labels say which);
+- it pushes `:master` only, and `:sha-<short>` keeps naming the image of the push.
