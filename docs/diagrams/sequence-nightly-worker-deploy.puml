@@ -1,0 +1,33 @@
+@startuml sequence-nightly-worker-deploy
+!include elvira.iuml
+' What: every run of image.yml (push or nightly) resolves evilflowers-worker master, tests and ships that commit, redeploys dev and reports the deploy to LGTM.
+' Source: .github/workflows/image.yml, .github/scripts/otlp-deploy.sh; knowledge Deploy-a-Service §4, CI-Deploy-Unification (2026-11-22)
+
+title image.yml: latest evilflowers-worker to evilflowers-dev, nightly (2026-11-22)
+
+participant "GitHub\nschedule / push" as gh
+participant "resolve\n(hosted)" as resolve <<focus>>
+participant "evilflowers-worker\nmaster" as kit
+participant "check + image\n(hosted)" as build
+database "GHCR\n:master" as ghcr
+participant "deploy\n(elvira-k3s runner)" as deploy
+participant "k3s API\nevilflowers-dev/ocr" as k8s
+participant "alloy-node\n:4318" as alloy
+
+gh -> resolve : 02:17 UTC cron\nor push to master
+resolve -> kit : uv lock --upgrade-package\nevilflowers-worker (HTTPS)
+kit --> resolve : commit R
+resolve -> ghcr : nightly: inspect :master labels\n(revision, worker revision)
+alt :master already has this commit + R
+  resolve -> gh : notice, skip build and deploy
+else something moved
+  resolve -> build : uv.lock artifact (R)
+  build -> build : lint + pytest on R
+  build -> build : docker build, selftest,\ninstalled worker == R
+  build -[$accent_msg()]> ghcr : <b>push :master</b>\n<b>label worker revision R</b>
+  build -> deploy : digest
+  deploy -> k8s : rollout restart, rollout status
+  deploy -> k8s : pods run the digest?
+  deploy -> alloy : OTLP/HTTP JSON:\nlog event.name=deployment\n+ span deploy (github-actions)
+end
+@enduml

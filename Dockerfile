@@ -3,7 +3,7 @@
 # -- build: the virtual environment from uv.lock, and the RapidOCR models -------------------------------------------
 FROM python:3.12-slim AS build
 
-# git: uv fetches evilflowers-worker from its pinned commit ([tool.uv.sources]).
+# git: uv fetches evilflowers-worker at the commit uv.lock records (CI re-resolves its `master` before every build).
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /bin/uv
@@ -51,7 +51,12 @@ WORKDIR /app
 COPY --from=build /app/.venv /app/.venv
 COPY --from=build /app/models /app/models
 
+# IMAGE_TAG becomes service.version on every span, metric and log (the kit's RuntimeSettings): CI passes
+# <ref>@<sha>+worker.<short>, so telemetry says which evilflowers-worker commit ran. The full commit is a label too:
+# the nightly run compares it with what :master already carries and skips the build when nothing moved.
 ARG IMAGE_TAG=dev
+ARG EVILFLOWERS_WORKER_REVISION=unknown
+LABEL sk.stuba.elvira.evilflowers-worker.revision=${EVILFLOWERS_WORKER_REVISION}
 # No REMAP_SIGTERM: SIGTERM (scale-in, rollout) is a warm shutdown and evilflowers-worker's `shutdown` cancels and
 # requeues the book after WORKER_SOFT_SHUTDOWN_TIMEOUT (issue #6). HOME=/tmp: anything that insists on a cache dir
 # writes to the emptyDir, never to the read-only root.
@@ -60,7 +65,8 @@ ENV PATH=/app/.venv/bin:$PATH \
     HOME=/tmp \
     OCRMYPDF_RAPIDOCR_MODEL_DIR=/app/models/rapidocr \
     STORAGE_PATH=/mnt/data \
-    IMAGE_TAG=${IMAGE_TAG}
+    IMAGE_TAG=${IMAGE_TAG} \
+    EVILFLOWERS_WORKER_REVISION=${EVILFLOWERS_WORKER_REVISION}
 
 USER 65534:65534
 
